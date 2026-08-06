@@ -80,6 +80,8 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))  # Increased for streaming
 STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "100"))  # Images per stream batch
 EPOCHS = int(os.getenv("EPOCHS", "20"))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-4"))
+EARLY_STOP_ACC = float(os.getenv("EARLY_STOP_ACC", "95.0"))  # stop once train acc hits this %
+EARLY_STOP_PATIENCE = int(os.getenv("EARLY_STOP_PATIENCE", "3"))  # stop if val acc doesn't improve for N epochs
 DATASET_NAME = os.getenv("DATASET_NAME", "SpreadSheets/Poketwo-Spawn-Images")
 MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
@@ -283,11 +285,13 @@ class Database:
 class PokemonFeatureExtractor(nn.Module):
     def __init__(self, embedding_dim: int = 256):
         super().__init__()
-        # MobileNetV3-Large: ~same param count as the old EfficientNet-B0
-        # (5.4M vs 5.3M) but 2-3x faster on CPU.
-        self.backbone = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+        # MobileNetV3-Small: much lighter/faster than Large on CPU
+        # (2.5M vs 5.4M params). Given how few images/species you're
+        # training on, Large's extra accuracy headroom isn't buying much
+        # anyway — speed matters more here.
+        self.backbone = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
         self.backbone.classifier = nn.Identity()
-        backbone_dim = 960  # lastconv_output_channels for mobilenet_v3_large
+        backbone_dim = 576  # lastconv_output_channels for mobilenet_v3_small
         
         self.projection = nn.Sequential(
             nn.Linear(backbone_dim, embedding_dim),
@@ -443,16 +447,32 @@ class StreamingPokemonDataset(IterableDataset):
                     break
             
             if label_col:
-                count = 0
-                for row in ds:
-                    raw_label = row[label_col]
-                    if isinstance(raw_label, int):
-                        raw_label = features[label_col].int2str(raw_label)
-                    species = str(raw_label).strip().lower()
-                    hf_species.add(species)
-                    count += 1
-                    if count > 500:  # Get enough for mapping
-                        break
+                # Fast path: if this is a HF ClassLabel column, the full
+                # species list is already in the schema — no need to scan
+                # rows at all. With 1,150 species, scanning rows to find
+                # them (the old approach, capped at 500 rows) would miss
+                # most species regardless of MAX_SPECIES.
+                col_feature = features[label_col]
+                names = getattr(col_feature, "names", None)
+                if names:
+                    hf_species = {str(n).strip().lower() for n in names}
+                    log.info(f"   📋 Got {len(hf_species)} species directly from dataset schema")
+                else:
+                    # Fallback: scan rows. Raised from 500 -> 20000 with a
+                    # heartbeat so it doesn't look frozen, but the schema
+                    # path above should be what actually fires.
+                    count = 0
+                    for row in ds:
+                        raw_label = row[label_col]
+                        if isinstance(raw_label, int):
+                            raw_label = features[label_col].int2str(raw_label)
+                        species = str(raw_label).strip().lower()
+                        hf_species.add(species)
+                        count += 1
+                        if count % 2000 == 0:
+                            log.info(f"   🔎 Scanned {count} rows, found {len(hf_species)} species so far")
+                        if count > 20000:
+                            break
         except Exception as e:
             log.warning(f"Could not get species from Hugging Face: {e}")
         
@@ -631,7 +651,7 @@ def stream_train():
     log.info("📥 Pre-loading AI model...")
     try:
         from torchvision import models
-        _ = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+        _ = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
         log.info("✅ Model loaded and cached!")
     except Exception as e:
         log.warning(f"⚠️ Model pre-load failed: {e}")
@@ -686,9 +706,13 @@ def stream_train():
     log.info(f"   Batch size: {BATCH_SIZE}")
     log.info(f"   Stream batch: {STREAM_BATCH_SIZE} images per batch")
     log.info(f"   Learning rate: {LEARNING_RATE}")
+    log.info(f"   Early-stop target: {EARLY_STOP_ACC}% train acc, "
+             f"or {EARLY_STOP_PATIENCE} epochs without val improvement")
     log.info("-" * 60)
     
     best_val_acc = 0.0
+    epochs_without_improvement = 0
+    stop_training = False
     
     for epoch in range(EPOCHS):
         log.info(f"\n📊 Epoch {epoch+1}/{EPOCHS}")
@@ -760,6 +784,17 @@ def stream_train():
                     acc = 100 * train_correct / train_total if train_total > 0 else 0
                     log.info(f"   📊 Batch {batch_count}: Loss: {train_loss/train_total:.3f}, Acc: {acc:.1f}%")
                     
+                    # Stop this epoch early once training accuracy hits the
+                    # target — no point grinding through remaining batches.
+                    # Require a few batches first so one lucky batch doesn't
+                    # trigger a false stop.
+                    if batch_count >= 3 and acc >= EARLY_STOP_ACC:
+                        log.info(f"   🎯 Reached target accuracy ({acc:.1f}% >= "
+                                 f"{EARLY_STOP_ACC}%), moving on early")
+                        del batch_imgs, batch_labels, pil_imgs
+                        gc.collect()
+                        break
+                    
                 except Exception as e:
                     log.warning(f"   ⚠️ Batch failed: {e}")
                 
@@ -774,8 +809,8 @@ def stream_train():
                 image_buffer = []
                 label_buffer = []
         
-        # Process any remaining images
-        if image_buffer:
+        # Process any remaining images (skip if we already hit target accuracy early)
+        if image_buffer and not (batch_count >= 3 and (100 * train_correct / train_total if train_total > 0 else 0) >= EARLY_STOP_ACC):
             batch_imgs = torch.stack(image_buffer)
             batch_labels = torch.tensor(label_buffer)
             
@@ -882,9 +917,25 @@ def stream_train():
         
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            epochs_without_improvement = 0
             os.makedirs(os.path.dirname(MODEL_OUTPUT) or ".", exist_ok=True)
             torch.save(model.feature_extractor.state_dict(), MODEL_OUTPUT)
             log.info(f"   ✅ Saved model (val acc: {val_acc:.1f}%)")
+        else:
+            epochs_without_improvement += 1
+        
+        # Stop across epochs if we've hit the target or plateaued
+        if train_acc >= EARLY_STOP_ACC:
+            log.info(f"   🎯 Training accuracy target reached ({train_acc:.1f}% >= "
+                     f"{EARLY_STOP_ACC}%), stopping training")
+            stop_training = True
+        elif epochs_without_improvement >= EARLY_STOP_PATIENCE:
+            log.info(f"   ⏸️ Val accuracy hasn't improved in {EARLY_STOP_PATIENCE} "
+                     f"epochs (best: {best_val_acc:.1f}%), stopping early")
+            stop_training = True
+        
+        if stop_training:
+            break
     
     log.info("-" * 60)
     log.info(f"✅ Training complete!")
