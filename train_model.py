@@ -1,6 +1,7 @@
 """
 train_model.py - Complete AI Pokémon Trainer for Railway
-Fetches from Hugging Face + your extra Pokémon, trains model, stores in database
+Fetches from Hugging Face + your extra Pokémon (ZIP support)
+Trains model, stores in database
 """
 
 import os
@@ -10,6 +11,8 @@ import logging
 import sqlite3
 import random
 import time
+import zipfile
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from io import BytesIO
@@ -38,6 +41,7 @@ LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-4"))
 DATASET_NAME = os.getenv("DATASET_NAME", "SpreadSheets/Poketwo-Spawn-Images")
 MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
+AUTO_EXTRACT_ZIP = os.getenv("AUTO_EXTRACT_ZIP", "true").lower() == "true"
 
 # Device
 DEVICE = torch.device("cpu")
@@ -49,6 +53,116 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 log = logging.getLogger("trainer")
+
+# ============ ZIP EXTRACTION ============
+
+def extract_zip_files():
+    """Extract any ZIP files in the current directory."""
+    if not AUTO_EXTRACT_ZIP:
+        return
+    
+    zip_files = list(Path(".").glob("*.zip"))
+    zip_files.extend(Path(".").glob("*.ZIP"))
+    
+    if not zip_files:
+        return
+    
+    log.info(f"📦 Found {len(zip_files)} ZIP file(s), extracting...")
+    
+    extra_dir = Path("Extra pokemons")
+    extra_dir.mkdir(exist_ok=True)
+    
+    extracted_count = 0
+    species_found = set()
+    
+    for zip_path in zip_files:
+        try:
+            temp_dir = Path(f"temp_extract_{zip_path.stem}")
+            temp_dir.mkdir(exist_ok=True)
+            
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+            
+            # Find all image files and organize by folder structure
+            # First, look for species folders
+            species_folders = []
+            
+            # Check if zip has folder structure
+            for item in temp_dir.iterdir():
+                if item.is_dir():
+                    # Check if this folder contains species folders or images directly
+                    sub_items = list(item.iterdir())
+                    if sub_items:
+                        # Check if sub_items are directories (species folders)
+                        has_species = any(s.is_dir() for s in sub_items)
+                        if has_species:
+                            # It's a folder with species subfolders
+                            for species_folder in sub_items:
+                                if species_folder.is_dir():
+                                    species_folders.append(species_folder)
+                        else:
+                            # It's a folder with images directly (single species)
+                            # Use the folder name as species name
+                            species_folders.append(item)
+                elif item.is_file() and item.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
+                    # Image directly in root - put in unknown
+                    unknown_dir = extra_dir / "unknown"
+                    unknown_dir.mkdir(exist_ok=True)
+                    shutil.move(str(item), str(unknown_dir / item.name))
+                    extracted_count += 1
+                    species_found.add("unknown")
+            
+            # Process species folders
+            for folder in species_folders:
+                species_name = folder.name.replace("_", " ").strip()
+                if not species_name:
+                    species_name = "unknown"
+                
+                dest_dir = extra_dir / folder.name
+                dest_dir.mkdir(exist_ok=True)
+                
+                # Move all images
+                images = []
+                for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp', '*.PNG', '*.JPG', '*.JPEG', '*.WEBP']:
+                    images.extend(folder.glob(ext))
+                
+                for img in images:
+                    dest_path = dest_dir / img.name
+                    # Handle duplicate filenames
+                    if dest_path.exists():
+                        counter = 1
+                        while dest_path.exists():
+                            stem = img.stem
+                            suffix = img.suffix
+                            dest_path = dest_dir / f"{stem}_{counter}{suffix}"
+                            counter += 1
+                    shutil.move(str(img), str(dest_path))
+                    extracted_count += 1
+                    species_found.add(species_name)
+            
+            # Clean up
+            shutil.rmtree(temp_dir)
+            
+            # Remove the zip file after extraction
+            zip_path.unlink()
+            log.info(f"   ✅ Extracted: {zip_path.name}")
+            
+        except Exception as e:
+            log.error(f"   ❌ Failed to extract {zip_path}: {e}")
+    
+    # Show what was extracted
+    if extra_dir.exists():
+        species = [f for f in extra_dir.iterdir() if f.is_dir()]
+        if species:
+            log.info(f"   📁 Extracted {len(species)} species from ZIP files:")
+            for s in species[:5]:
+                count = len(list(s.glob("*")))
+                log.info(f"      - {s.name}: {count} images")
+            if len(species) > 5:
+                log.info(f"      ... and {len(species) - 5} more")
+        
+        total_images = sum(len(list(f.glob("*"))) for f in species)
+        log.info(f"   📊 Total images extracted: {total_images}")
 
 # ============ DATABASE LAYER ============
 
@@ -164,6 +278,12 @@ class Database:
         cursor.execute("SELECT count FROM species_info WHERE species = ?", (species,))
         row = cursor.fetchone()
         return row[0] if row else 0
+    
+    def get_species_features(self, species: str) -> List[np.ndarray]:
+        """Get features for a specific species."""
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT feature_vector FROM pokemon_features WHERE species = ?", (species,))
+        return [np.array(json.loads(row[0])) for row in cursor.fetchall()]
     
     def get_stats(self) -> Dict[str, Any]:
         """Get database statistics."""
@@ -377,7 +497,7 @@ class PokemonDataset(Dataset):
         
         log.info(f"📁 Loading extra Pokémon from: {extra_dir}")
         
-        valid_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+        valid_extensions = {".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG", ".WEBP"}
         species_counts = {}
         
         for folder in extra_path.iterdir():
@@ -385,13 +505,13 @@ class PokemonDataset(Dataset):
                 continue
             
             species = folder.name.replace("_", " ").strip().lower()
+            if not species:
+                species = "unknown"
+            
+            # Add to species mapping if not exists
             if species not in self.species_to_idx:
-                log.warning(f"   ⚠️ Species '{species}' not in species list, adding...")
-                # Add to species mapping
                 idx = len(self.species_to_idx)
                 self.species_to_idx[species] = idx
-                # Update dataset samples label mapping
-                # We'll handle this after loading all samples
             
             # Load images
             images = []
@@ -413,10 +533,6 @@ class PokemonDataset(Dataset):
             for img_path in images:
                 try:
                     img = Image.open(img_path).convert("RGB")
-                    # Get or create index for this species
-                    if species not in self.species_to_idx:
-                        idx = len(self.species_to_idx)
-                        self.species_to_idx[species] = idx
                     
                     self.samples.append((img, self.species_to_idx[species]))
                     self.species_images.setdefault(species, []).append(img)
@@ -467,6 +583,8 @@ class PokemonDataset(Dataset):
                 for s in extra_species[:5]:
                     count = self.species_stats.get(s.lower().replace("_", " ").strip(), 0)
                     log.info(f"   - {s}: {count} images")
+                if len(extra_species) > 5:
+                    log.info(f"   ... and {len(extra_species) - 5} more")
         
         log.info("=" * 60)
     
@@ -488,8 +606,12 @@ def train():
     log.info("🚀 Pokémon AI Trainer")
     log.info("=" * 60)
     
+    # Extract any ZIP files
+    log.info("📦 Checking for ZIP files...")
+    extract_zip_files()
+    
     # Initialize database
-    log.info("📂 Connecting to database...")
+    log.info("\n📂 Connecting to database...")
     db = Database()
     stats = db.get_stats()
     log.info(f"   Existing species: {stats['total_species']}")
@@ -530,6 +652,14 @@ def train():
         extra_species = [f.name.replace("_", " ").strip().lower() 
                          for f in extra_path.iterdir() if f.is_dir()]
         log.info(f"   Found {len(extra_species)} extra Pokémon species")
+        
+        # Show what was found
+        for s in extra_species[:5]:
+            folder = extra_path / s.replace(" ", "_")
+            count = len(list(folder.glob("*"))) if folder.exists() else 0
+            log.info(f"      - {s}: {count} images")
+        if len(extra_species) > 5:
+            log.info(f"      ... and {len(extra_species) - 5} more")
     
     # Combine species
     all_species = sorted(hf_species | set(extra_species))
@@ -726,6 +856,9 @@ def train():
     log.info("\n" + "=" * 60)
     log.info("✅ All done! Model is ready to use.")
     log.info("=" * 60)
+    
+    # Close database
+    db.close()
 
 
 if __name__ == "__main__":
