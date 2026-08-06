@@ -15,7 +15,6 @@ import time
 import zipfile
 import shutil
 import subprocess
-import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from io import BytesIO
@@ -31,19 +30,15 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 
-# ============ SUPPRESS WARNINGS ============
-warnings.filterwarnings("ignore")
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-
-# Suppress HTTP request logs from huggingface
+# ============ SETUP LOGGING ============
+# Suppress verbose HTTP/urllib3 logs
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
-logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 logging.getLogger("datasets").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 logging.getLogger("filelock").setLevel(logging.WARNING)
 
-# ============ SETUP LOGGING ============
+# Only show INFO and above from our trainer
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
@@ -64,12 +59,14 @@ MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
 AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "true"
 
+# Set Hugging Face token
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
-    log.info(f"🔑 HF_TOKEN configured ✅")
+    log.info(f"🔑 HF_TOKEN configured (length: {len(HF_TOKEN)})")
 else:
-    log.warning("⚠️ HF_TOKEN not set. Get from: https://huggingface.co/settings/tokens")
+    log.warning("⚠️ HF_TOKEN not set. Get token from: https://huggingface.co/settings/tokens")
 
+# Device
 DEVICE = torch.device("cpu")
 torch.set_num_threads(os.cpu_count() or 4)
 
@@ -85,15 +82,15 @@ def extract_archive_files():
         archives.extend(Path(".").glob(pattern))
     
     if not archives:
+        log.info("📦 No archive files found.")
         return
     
-    log.info(f"📦 Found {len(archives)} archive file(s)...")
+    log.info(f"📦 Found {len(archives)} archive file(s), extracting...")
     
     extra_dir = Path("Extra pokemons")
     extra_dir.mkdir(exist_ok=True)
     
     extracted_count = 0
-    species_found = set()
     
     for archive_path in archives:
         try:
@@ -102,61 +99,52 @@ def extract_archive_files():
             temp_dir.mkdir(exist_ok=True)
             
             if ext in ['.zip']:
+                log.info(f"   📂 Extracting ZIP: {archive_path.name}")
                 with zipfile.ZipFile(archive_path, 'r') as zip_ref:
                     zip_ref.extractall(temp_dir)
             
             elif ext in ['.rar']:
+                log.info(f"   📂 Extracting RAR: {archive_path.name}")
                 try:
                     import rarfile
                     with rarfile.RarFile(archive_path) as rf:
                         rf.extractall(temp_dir)
                 except:
-                    try:
-                        subprocess.run(['unrar', 'x', '-y', str(archive_path), str(temp_dir)], 
-                                     capture_output=True, timeout=60)
-                    except:
-                        log.error(f"   ❌ Cannot extract RAR. Use ZIP format.")
-                        shutil.rmtree(temp_dir)
-                        continue
+                    # Try unrar command
+                    subprocess.run(['unrar', 'x', '-y', str(archive_path), str(temp_dir)], 
+                                 capture_output=True, check=False)
             
             elif ext in ['.7z']:
+                log.info(f"   📂 Extracting 7z: {archive_path.name}")
                 try:
                     import py7zr
                     with py7zr.SevenZipFile(archive_path, 'r') as sz:
                         sz.extractall(temp_dir)
                 except:
-                    try:
-                        subprocess.run(['7z', 'x', '-y', str(archive_path), f'-o{temp_dir}'], 
-                                     capture_output=True, timeout=60)
-                    except:
-                        log.error(f"   ❌ Cannot extract 7z.")
-                        shutil.rmtree(temp_dir)
-                        continue
-            
-            else:
-                shutil.rmtree(temp_dir)
-                continue
+                    subprocess.run(['7z', 'x', '-y', str(archive_path), f'-o{temp_dir}'], 
+                                 capture_output=True, check=False)
             
             # Process extracted files
             extracted, species = process_extracted_files(temp_dir, extra_dir)
             extracted_count += extracted
-            species_found.update(species)
             
             shutil.rmtree(temp_dir)
             archive_path.unlink()
-            log.info(f"   ✅ {archive_path.name} → {extracted} images, {len(species)} species")
+            log.info(f"   ✅ Extracted: {archive_path.name} ({extracted} images)")
             
         except Exception as e:
-            log.error(f"   ❌ Failed: {archive_path.name}")
+            log.error(f"   ❌ Failed to extract {archive_path}: {e}")
             if temp_dir.exists():
                 shutil.rmtree(temp_dir)
     
-    if extracted_count > 0:
-        log.info(f"   📊 Total: {extracted_count} images, {len(species_found)} species")
+    if extra_dir.exists():
+        species = [f for f in extra_dir.iterdir() if f.is_dir()]
+        if species:
+            log.info(f"   📁 Extracted {len(species)} species, {extracted_count} images total")
 
 
 def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
-    """Process extracted files and organize into species folders."""
+    """Process extracted files and organize them into species folders."""
     extracted_count = 0
     species_found = set()
     
@@ -169,8 +157,6 @@ def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
         if images:
             rel_path = root_path.relative_to(temp_dir)
             species_name = rel_path.parts[0].replace("_", " ").strip() if rel_path.parts else "unknown"
-            if not species_name:
-                species_name = "unknown"
             
             dest_dir = extra_dir / species_name.replace(" ", "_")
             dest_dir.mkdir(exist_ok=True)
@@ -188,32 +174,14 @@ def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
                 shutil.move(str(src), str(dest))
                 extracted_count += 1
                 species_found.add(species_name)
-        
-        for d in dirs:
-            sub_path = root_path / d
-            sub_images = [f for f in sub_path.iterdir() if f.suffix in valid_extensions]
-            if sub_images:
-                species_name = d.replace("_", " ").strip() or "unknown"
-                dest_dir = extra_dir / species_name.replace(" ", "_")
-                dest_dir.mkdir(exist_ok=True)
-                for img in sub_images:
-                    dest = dest_dir / img.name
-                    if dest.exists():
-                        counter = 1
-                        stem = img.stem
-                        suffix = img.suffix
-                        while dest.exists():
-                            dest = dest_dir / f"{stem}_{counter}{suffix}"
-                            counter += 1
-                    shutil.move(str(img), str(dest))
-                    extracted_count += 1
-                    species_found.add(species_name)
     
     return extracted_count, species_found
 
 # ============ DATABASE LAYER ============
 
 class Database:
+    """Simple database with Turso or SQLite fallback."""
+    
     def __init__(self):
         self.use_turso = False
         self._conn = None
@@ -225,12 +193,12 @@ class Database:
                 self.use_turso = True
                 log.info(f"✅ Connected to Turso database")
             except Exception as e:
-                log.warning(f"Turso failed, using SQLite")
+                log.warning(f"Turso connection failed: {e}, using SQLite fallback")
         
         if not self.use_turso:
             self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
-            log.info(f"✅ Using SQLite database")
+            log.info(f"✅ Using SQLite database: {DB_PATH}")
         
         self._create_tables()
     
@@ -261,8 +229,10 @@ class Database:
             )
         """)
         self._conn.commit()
+        log.info("✅ Database tables ready")
     
-    def add_pokemon_features(self, species: str, features: List[np.ndarray], variant_names: List[str] = None):
+    def add_pokemon_features(self, species: str, features: List[np.ndarray], 
+                             variant_names: List[str] = None):
         if variant_names is None:
             variant_names = [f"{species}_{i+1}" for i in range(len(features))]
         
@@ -303,23 +273,16 @@ class PokemonFeatureExtractor(nn.Module):
         self.backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
         self.backbone.classifier = nn.Identity()
         backbone_dim = 1280
-        
         self.projection = nn.Sequential(
             nn.Linear(backbone_dim, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim),
         )
-        
-        self.normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-        
+        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
         ])
-        
         self.to(DEVICE)
         self.eval()
     
@@ -337,8 +300,7 @@ class PokemonFeatureExtractor(nn.Module):
     def extract_batch(self, images: List[Image.Image]) -> np.ndarray:
         batch = []
         for img in images:
-            img_tensor = self.transform(img).unsqueeze(0)
-            batch.append(img_tensor)
+            batch.append(self.transform(img).unsqueeze(0))
         batch_tensor = torch.cat(batch, dim=0).to(DEVICE)
         batch_tensor = self.normalize(batch_tensor)
         features = self.backbone(batch_tensor)
@@ -366,7 +328,7 @@ class PokemonClassifier(nn.Module):
         return features_tensor, logits
 
 
-# ============ DATASET WITH PROGRESS ============
+# ============ DATASET ============
 
 class PokemonDataset(Dataset):
     def __init__(self, species_to_idx: Dict[str, int], max_per_species: int = 10, extra_dir: str = "Extra pokemons"):
@@ -385,26 +347,29 @@ class PokemonDataset(Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
+        # Load from Hugging Face
         self._load_huggingface()
+        
+        # Load local extras
         self._load_extra_pokemon(extra_dir)
         
         random.shuffle(self.samples)
         self._print_stats()
     
     def _load_huggingface(self):
-        """Load images from Hugging Face with progress display."""
-        log.info(f"📥 Loading from Hugging Face...")
+        """Load images from Hugging Face dataset with progress checkpoints."""
+        log.info(f"📥 Loading Hugging Face dataset: {DATASET_NAME}")
         
         try:
             from datasets import load_dataset
             
             # Suppress dataset logs
-            import datasets.utils.logging
-            datasets.utils.logging.set_verbosity_error()
+            import warnings
+            warnings.filterwarnings("ignore")
             
             ds = load_dataset(DATASET_NAME, split="train", streaming=True)
             
-            # Detect columns silently
+            # Detect columns
             features = ds.features
             label_col = None
             image_col = None
@@ -425,10 +390,9 @@ class PokemonDataset(Dataset):
             species_set = set(self.species_to_idx.keys())
             species_counts = {}
             count = 0
-            downloaded = 0
+            checkpoint = 0
             
-            # Show progress
-            print(f"   Searching for images... (will stop at {len(species_set) * self.max_per_species} max)")
+            log.info(f"   🔄 Scanning dataset for matching species...")
             
             for row in ds:
                 try:
@@ -440,7 +404,6 @@ class PokemonDataset(Dataset):
                     
                     if species not in species_set:
                         continue
-                    
                     if species_counts.get(species, 0) >= self.max_per_species:
                         continue
                     
@@ -455,47 +418,44 @@ class PokemonDataset(Dataset):
                     self.species_images.setdefault(species, []).append(img)
                     species_counts[species] = species_counts.get(species, 0) + 1
                     count += 1
-                    downloaded += 1
                     
-                    # Show progress every 10 images
-                    if downloaded % 10 == 0:
-                        total_needed = len(species_set) * self.max_per_species
-                        print(f"   📥 Downloaded {downloaded} images...", end="\r")
+                    # CHECKPOINT: Report every 50 images
+                    if count % 50 == 0:
+                        checkpoint += 50
+                        log.info(f"   📊 Checkpoint: {checkpoint} images loaded from Hugging Face")
                     
                 except Exception:
                     continue
                 
-                # Stop when we have enough
-                total_needed = len(species_set) * self.max_per_species
-                if count >= total_needed or count >= 2000:
+                # Stop after we have enough
+                if count > 1000:
                     break
             
             self.species_stats.update(species_counts)
-            print(f"\n   ✅ Loaded {len(self.samples)} images from Hugging Face")
+            log.info(f"   ✅ Loaded {len(self.samples)} samples from Hugging Face")
+            return True
             
         except Exception as e:
-            # Don't show full error, just a simple message
-            if "429" in str(e):
-                print(f"   ⚠️ Rate limited. Try HF_TOKEN for higher limits.")
-            else:
-                print(f"   ⚠️ Using local images only (HF dataset unavailable)")
+            log.warning(f"   ⚠️ Failed to load Hugging Face dataset: {e}")
+            return False
     
     def _load_extra_pokemon(self, extra_dir: str):
         extra_path = Path(extra_dir)
         if not extra_path.exists():
             return
         
-        print(f"📁 Loading local images from: {extra_dir}")
+        log.info(f"📁 Loading extra Pokémon from: {extra_dir}")
         
         valid_extensions = {".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG", ".WEBP"}
         species_counts = {}
-        loaded = 0
         
         for folder in extra_path.iterdir():
             if not folder.is_dir():
                 continue
             
-            species = folder.name.replace("_", " ").strip().lower() or "unknown"
+            species = folder.name.replace("_", " ").strip().lower()
+            if not species:
+                species = "unknown"
             
             if species not in self.species_to_idx:
                 idx = len(self.species_to_idx)
@@ -521,25 +481,20 @@ class PokemonDataset(Dataset):
                     self.samples.append((img, self.species_to_idx[species]))
                     self.species_images.setdefault(species, []).append(img)
                     species_counts[species] = species_counts.get(species, 0) + 1
-                    loaded += 1
                 except Exception:
                     continue
         
         for species, count in species_counts.items():
             self.species_stats[species] = self.species_stats.get(species, 0) + count
         
-        print(f"   ✅ Loaded {loaded} images from local files")
+        log.info(f"   ✅ Loaded {len(self.samples)} samples from extra Pokémon")
     
     def _print_stats(self):
         log.info("=" * 60)
         log.info("📊 DATASET STATISTICS")
         log.info("=" * 60)
-        
-        total = len(self.samples)
-        species_count = len(self.species_stats)
-        
-        log.info(f"   Total samples: {total}")
-        log.info(f"   Total species: {species_count}")
+        log.info(f"   Total samples: {len(self.samples)}")
+        log.info(f"   Total species: {len(self.species_stats)}")
         
         if self.species_stats:
             counts = list(self.species_stats.values())
@@ -547,6 +502,7 @@ class PokemonDataset(Dataset):
             log.info(f"   Min per species: {min(counts)}")
             log.info(f"   Max per species: {max(counts)}")
         
+        # Show species with low counts
         low_species = [s for s, c in self.species_stats.items() if c < 3]
         if low_species:
             log.warning(f"\n⚠️ {len(low_species)} species have < 3 images:")
@@ -576,12 +532,12 @@ def train():
     
     # Show HF_TOKEN status
     if HF_TOKEN:
-        log.info(f"🔑 HF_TOKEN: ✅ Set")
+        log.info(f"🔑 HF_TOKEN: ✅ Set (length: {len(HF_TOKEN)})")
     else:
-        log.warning(f"🔑 HF_TOKEN: ❌ Not set")
+        log.warning(f"🔑 HF_TOKEN: ❌ Not set - Get from https://huggingface.co/settings/tokens")
     
     # Extract archives
-    log.info("\n📦 Extracting archives...")
+    log.info("\n📦 Checking for archive files...")
     extract_archive_files()
     
     # Initialize database
@@ -591,7 +547,7 @@ def train():
     log.info(f"   Existing species: {stats['total_species']}")
     log.info(f"   Existing features: {stats['total_features']}")
     
-    # Check extra Pokémon
+    # Check for extra Pokémon
     extra_path = Path("Extra pokemons")
     extra_species = []
     if extra_path.exists():
@@ -599,7 +555,6 @@ def train():
                          for f in extra_path.iterdir() if f.is_dir()]
         log.info(f"📁 Found {len(extra_species)} extra Pokémon species")
         
-        # Show some examples
         for s in extra_species[:5]:
             folder = extra_path / s.replace(" ", "_")
             count = len(list(folder.glob("*"))) if folder.exists() else 0
@@ -608,7 +563,7 @@ def train():
             log.info(f"      ... and {len(extra_species) - 5} more")
     
     if not extra_species:
-        log.error("❌ No extra Pokémon found!")
+        log.error("❌ No extra Pokémon found! Please upload images.")
         return
     
     all_species = sorted(extra_species)
@@ -627,7 +582,7 @@ def train():
     )
     
     if len(dataset) == 0:
-        log.error("❌ No samples loaded!")
+        log.error("❌ No samples loaded! Exiting.")
         return
     
     # Split dataset
@@ -642,6 +597,7 @@ def train():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
     
+    log.info(f"\n📊 Dataset split:")
     log.info(f"   Train samples: {train_size}")
     log.info(f"   Val samples: {val_size}")
     
@@ -664,6 +620,7 @@ def train():
     best_val_acc = 0.0
     
     for epoch in range(EPOCHS):
+        # Training
         model.train()
         train_loss = 0.0
         train_correct = 0
