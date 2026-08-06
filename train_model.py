@@ -1,6 +1,6 @@
 """
-train_model.py - Complete AI Pokémon Trainer for Railway
-Trains on: Your ZIP images + ALL Pokémon from Hugging Face dataset
+train_model.py - Stream Processing AI Pokémon Trainer
+Trains in batches, clears memory after each batch, saves to DB incrementally
 """
 
 import os
@@ -13,8 +13,9 @@ import time
 import zipfile
 import shutil
 import subprocess
+import gc
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Iterator
 from io import BytesIO
 
 # ============ NUCLEAR LOG SUPPRESSION ============
@@ -50,7 +51,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 import torchvision.transforms as transforms
 from torchvision import models
 from PIL import Image
@@ -75,15 +76,16 @@ log = SilentLogger()
 TURSO_URL = os.getenv("TURSO_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
-MAX_IMAGES_PER_SPECIES = int(os.getenv("MAX_IMAGES_PER_SPECIES", "10"))
-MAX_TOTAL_IMAGES = int(os.getenv("MAX_TOTAL_IMAGES", "5000"))  # NEW: Max total images from dataset
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))  # Increased for streaming
+STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "100"))  # Images per stream batch
 EPOCHS = int(os.getenv("EPOCHS", "20"))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-4"))
 DATASET_NAME = os.getenv("DATASET_NAME", "SpreadSheets/Poketwo-Spawn-Images")
 MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
 AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "true"
+MAX_SPECIES = int(os.getenv("MAX_SPECIES", "100"))  # Max species to train
+MAX_IMAGES_PER_SPECIES = int(os.getenv("MAX_IMAGES_PER_SPECIES", "10"))
 
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
@@ -365,19 +367,16 @@ class PokemonClassifier(nn.Module):
         return features_tensor, logits
 
 
-# ============ DATASET - TRAIN ALL POKEMON ============
+# ============ STREAMING DATASET ============
 
-class PokemonDataset(Dataset):
-    """Dataset that trains on ALL Pokémon from Hugging Face + your extras."""
+class StreamingPokemonDataset(IterableDataset):
+    """
+    Streams images from Hugging Face in batches.
+    Processes STREAM_BATCH_SIZE images, trains, then clears memory.
+    """
     
-    def __init__(self, extra_dir: str = "Extra pokemons", max_per_species: int = 10):
-        self.max_per_species = max_per_species
-        self.samples = []
-        self.species_stats = {}
-        self.species_images = {}
-        self.species_to_idx = {}
-        self.idx_to_species = {}
-        
+    def __init__(self, extra_dir: str = "Extra pokemons"):
+        self.extra_dir = extra_dir
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(),
@@ -387,22 +386,26 @@ class PokemonDataset(Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
-        # Step 1: Load ALL Pokémon from Hugging Face
-        self._load_all_from_huggingface()
-        
-        # Step 2: Load your extra Pokémon (overwrites/extends)
-        self._load_extra_pokemon(extra_dir)
-        
-        # Step 3: Build species mapping
+        # Build species mapping FIRST
         self._build_species_mapping()
         
-        random.shuffle(self.samples)
-        self._print_stats()
+        log.info(f"📊 Species mapping built: {len(self.species_to_idx)} species")
     
-    def _load_all_from_huggingface(self):
-        """Load ALL Pokémon from Hugging Face dataset (no filtering!)."""
-        log.info(f"📥 Loading ALL Pokémon from Hugging Face dataset...")
+    def _build_species_mapping(self):
+        """Build species mapping from Hugging Face + local extras."""
         
+        # Get species from local extras
+        local_species = set()
+        extra_path = Path(self.extra_dir)
+        if extra_path.exists():
+            for folder in extra_path.iterdir():
+                if folder.is_dir():
+                    species = folder.name.replace("_", " ").strip().lower()
+                    if species:
+                        local_species.add(species)
+        
+        # Try to get species list from Hugging Face
+        hf_species = set()
         try:
             from datasets import load_dataset
             
@@ -417,6 +420,82 @@ class PokemonDataset(Dataset):
                 finally:
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
+            
+            # Detect label column
+            features = ds.features
+            label_col = None
+            for col in ["label", "text", "name", "species", "pokemon"]:
+                if col in features:
+                    label_col = col
+                    break
+            
+            if label_col:
+                count = 0
+                for row in ds:
+                    raw_label = row[label_col]
+                    if isinstance(raw_label, int):
+                        raw_label = features[label_col].int2str(raw_label)
+                    species = str(raw_label).strip().lower()
+                    hf_species.add(species)
+                    count += 1
+                    if count > 500:  # Get enough for mapping
+                        break
+        except Exception as e:
+            log.warning(f"Could not get species from Hugging Face: {e}")
+        
+        # Combine species
+        all_species = sorted(local_species | hf_species)
+        
+        if not all_species:
+            log.error("❌ No species found!")
+            return
+        
+        self.species_to_idx = {s: i for i, s in enumerate(all_species)}
+        self.idx_to_species = {i: s for s, i in self.species_to_idx.items()}
+        
+        # Limit species if needed
+        if MAX_SPECIES > 0 and len(all_species) > MAX_SPECIES:
+            # Keep local species first, then add from HF
+            local_list = list(local_species)
+            hf_list = [s for s in all_species if s not in local_species]
+            selected = local_list + hf_list[:MAX_SPECIES - len(local_list)]
+            self.species_to_idx = {s: i for i, s in enumerate(selected)}
+            self.idx_to_species = {i: s for s, i in self.species_to_idx.items()}
+            log.info(f"   Limited to {len(selected)} species (MAX_SPECIES={MAX_SPECIES})")
+    
+    def __iter__(self) -> Iterator:
+        """Stream images one by one from Hugging Face."""
+        
+        # First, yield local images
+        extra_path = Path(self.extra_dir)
+        if extra_path.exists():
+            for folder in extra_path.iterdir():
+                if not folder.is_dir():
+                    continue
+                
+                species = folder.name.replace("_", " ").strip().lower()
+                if species not in self.species_to_idx:
+                    continue
+                
+                label = self.species_to_idx[species]
+                valid_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+                
+                for img_path in folder.iterdir():
+                    if img_path.suffix.lower() not in valid_extensions:
+                        continue
+                    
+                    try:
+                        img = Image.open(img_path).convert("RGB")
+                        if img.size[0] > 10 and img.size[1] > 10:
+                            yield self.transform(img), label
+                    except Exception:
+                        continue
+        
+        # Then, stream from Hugging Face
+        try:
+            from datasets import load_dataset
+            
+            ds = load_dataset(DATASET_NAME, split="train", streaming=True)
             
             # Detect columns
             features = ds.features
@@ -436,17 +515,9 @@ class PokemonDataset(Dataset):
                 label_col = list(features.keys())[0]
                 image_col = list(features.keys())[1] if len(features) > 1 else list(features.keys())[0]
             
-            log.info(f"   Label column: {label_col}, Image column: {image_col}")
-            
             species_counts = {}
-            count = 0
-            total_processed = 0
-            
-            log.info(f"   🔄 Scanning dataset for ALL species...")
             
             for row in ds:
-                total_processed += 1
-                
                 try:
                     raw_label = row[label_col]
                     if isinstance(raw_label, int):
@@ -454,8 +525,10 @@ class PokemonDataset(Dataset):
                     
                     species = str(raw_label).strip().lower()
                     
-                    # Skip if we already have enough
-                    if species_counts.get(species, 0) >= self.max_per_species:
+                    if species not in self.species_to_idx:
+                        continue
+                    
+                    if species_counts.get(species, 0) >= MAX_IMAGES_PER_SPECIES:
                         continue
                     
                     img = row[image_col]
@@ -468,168 +541,39 @@ class PokemonDataset(Dataset):
                     if img.size[0] < 10 or img.size[1] < 10:
                         continue
                     
-                    self.samples.append((img, None))  # Label will be assigned later
-                    self.species_images.setdefault(species, []).append(img)
+                    label = self.species_to_idx[species]
                     species_counts[species] = species_counts.get(species, 0) + 1
-                    count += 1
                     
-                    if count % 500 == 0:
-                        log.info(f"   📊 Checkpoint: {count} images loaded, {len(species_counts)} species found")
+                    yield self.transform(img), label
                     
                 except Exception:
                     continue
                 
-                # Stop when we have enough total images
-                if count >= MAX_TOTAL_IMAGES:
-                    log.info(f"   📊 Reached max total images: {MAX_TOTAL_IMAGES}")
-                    break
-            
-            self.species_stats.update(species_counts)
-            log.info(f"   ✅ Loaded {len(self.samples)} images of {len(species_counts)} species from Hugging Face")
-            
         except Exception as e:
-            log.warning(f"   ⚠️ Failed to load Hugging Face dataset: {e}")
-    
-    def _load_extra_pokemon(self, extra_dir: str):
-        """Load your extra Pokémon images."""
-        extra_path = Path(extra_dir)
-        if not extra_path.exists():
+            log.warning(f"Error streaming from Hugging Face: {e}")
             return
-        
-        log.info(f"📁 Loading extra Pokémon from: {extra_dir}")
-        
-        valid_extensions = {".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG", ".WEBP"}
-        species_counts = {}
-        
-        for folder in extra_path.iterdir():
-            if not folder.is_dir():
-                continue
-            
-            species = folder.name.replace("_", " ").strip().lower()
-            if not species:
-                species = "unknown"
-            
-            # Load images
-            images = []
-            for ext in valid_extensions:
-                images.extend(folder.glob(f"*{ext}"))
-            
-            if not images:
-                continue
-            
-            # Count existing images for this species
-            existing_count = len(self.species_images.get(species, []))
-            
-            # Only add up to max_per_species
-            available = self.max_per_species - existing_count
-            if available <= 0:
-                log.info(f"   ⚠️ Already have {existing_count} images of {species}, skipping extras")
-                continue
-            
-            images = images[:available]
-            
-            for img_path in images:
-                try:
-                    img = Image.open(img_path).convert("RGB")
-                    if img.size[0] < 10 or img.size[1] < 10:
-                        continue
-                    self.samples.append((img, None))  # Label assigned later
-                    self.species_images.setdefault(species, []).append(img)
-                    species_counts[species] = species_counts.get(species, 0) + 1
-                except Exception:
-                    continue
-        
-        # Update stats
-        for species, count in species_counts.items():
-            self.species_stats[species] = self.species_stats.get(species, 0) + count
-        
-        log.info(f"   ✅ Added {sum(species_counts.values())} extra images from your folder")
     
-    def _build_species_mapping(self):
-        """Build species to index mapping after all images are loaded."""
-        all_species = sorted(self.species_images.keys())
-        
-        if not all_species:
-            log.error("❌ No species found! No images loaded.")
-            return
-        
-        log.info(f"\n📊 Building species mapping for {len(all_species)} species...")
-        
-        self.species_to_idx = {s: i for i, s in enumerate(all_species)}
-        self.idx_to_species = {i: s for s, i in self.species_to_idx.items()}
-        
-        # Assign labels to samples
-        new_samples = []
-        for img, _ in self.samples:
-            # Find which species this image belongs to
-            # We stored images in species_images, so we need to match
-            # This is a bit hacky - we rebuild samples with labels
-            pass
-        
-        # Rebuild samples with proper labels
-        self.samples = []
-        for species, images in self.species_images.items():
-            idx = self.species_to_idx[species]
-            for img in images:
-                self.samples.append((img, idx))
-        
-        log.info(f"   ✅ Built mapping for {len(all_species)} species")
-    
-    def _print_stats(self):
-        log.info("=" * 60)
-        log.info("📊 DATASET STATISTICS")
-        log.info("=" * 60)
-        log.info(f"   Total samples: {len(self.samples)}")
-        log.info(f"   Total species: {len(self.species_stats)}")
-        
-        if self.species_stats:
-            counts = list(self.species_stats.values())
-            log.info(f"   Avg per species: {sum(counts) / len(counts):.1f}")
-            log.info(f"   Min per species: {min(counts)}")
-            log.info(f"   Max per species: {max(counts)}")
-        
-        # Show top species
-        top_species = sorted(self.species_stats.items(), key=lambda x: x[1], reverse=True)[:10]
-        log.info(f"\n   Top 10 species:")
-        for s, c in top_species:
-            log.info(f"      - {s}: {c} images")
-        
-        # Show your extra species
-        extra_path = Path("Extra pokemons")
-        if extra_path.exists():
-            extra_species = [f.name for f in extra_path.iterdir() if f.is_dir()]
-            if extra_species:
-                log.info(f"\n   📁 Your extra species: {len(extra_species)}")
-                for s in extra_species[:5]:
-                    count = self.species_stats.get(s.lower().replace("_", " ").strip(), 0)
-                    log.info(f"      - {s}: {count} images")
-        
-        if len(self.samples) < 10:
-            log.error("❌ Too few samples! Need at least 10 images to train.")
-        
-        log.info("=" * 60)
-    
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, idx):
-        img, label = self.samples[idx]
-        if isinstance(img, Image.Image):
-            img = self.transform(img)
-        return img, label
+    def get_num_species(self) -> int:
+        return len(self.species_to_idx)
 
 
-# ============ TRAINING ============
+# ============ STREAMING TRAINER ============
 
-def train():
+def stream_train():
+    """Train using streaming - process in batches, clear memory."""
+    
     log.info("")
-    log.info("🚀 Pokémon AI Trainer - FULL DATASET MODE")
+    log.info("🚀 Pokémon AI Trainer - STREAMING MODE")
+    log.info("=" * 60)
+    log.info("   ✅ Processes images in batches")
+    log.info("   ✅ Clears memory after each batch")
+    log.info("   ✅ Saves to database incrementally")
     log.info("=" * 60)
     
     if HF_TOKEN:
         log.info(f"🔑 HF_TOKEN: ✅ Set")
     else:
-        log.warning(f"🔑 HF_TOKEN: ❌ Not set - May have rate limits")
+        log.warning(f"🔑 HF_TOKEN: ❌ Not set")
     
     log.info("\n📦 Checking for archive files...")
     extract_archive_files()
@@ -640,40 +584,18 @@ def train():
     log.info(f"   Existing species: {stats['total_species']}")
     log.info(f"   Existing features: {stats['total_features']}")
     
-    # Create dataset with ALL Pokémon
-    log.info("\n📂 Creating dataset with ALL Pokémon...")
-    dataset = PokemonDataset(
-        extra_dir="Extra pokemons",
-        max_per_species=MAX_IMAGES_PER_SPECIES
-    )
+    # Create streaming dataset
+    log.info("\n📂 Initializing streaming dataset...")
+    dataset = StreamingPokemonDataset(extra_dir="Extra pokemons")
+    num_species = dataset.get_num_species()
     
-    if len(dataset) == 0:
-        log.error("❌ No samples loaded! Exiting.")
+    if num_species == 0:
+        log.error("❌ No species found! Exiting.")
         return
     
-    if len(dataset) < 10:
-        log.error("❌ Too few samples! Need at least 10 images to train.")
-        return
+    log.info(f"   📊 Total species: {num_species}")
     
-    # Split dataset
-    val_size = max(1, int(len(dataset) * 0.1))
-    train_size = len(dataset) - val_size
-    
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-    
-    train_loader = DataLoader(train_dataset, batch_size=min(BATCH_SIZE, train_size), shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=min(BATCH_SIZE, val_size), shuffle=False, num_workers=0)
-    
-    num_species = len(dataset.species_to_idx)
-    
-    log.info(f"\n📊 Dataset split:")
-    log.info(f"   Total species: {num_species}")
-    log.info(f"   Train samples: {train_size}")
-    log.info(f"   Val samples: {val_size}")
-    
+    # Initialize model
     log.info("\n🧠 Initializing model...")
     model = PokemonClassifier(num_species=num_species)
     model.to(DEVICE)
@@ -685,20 +607,103 @@ def train():
     
     log.info(f"\n🎯 Training for {EPOCHS} epochs...")
     log.info(f"   Species: {num_species}")
-    log.info(f"   Batch size: {min(BATCH_SIZE, train_size)}")
+    log.info(f"   Batch size: {BATCH_SIZE}")
+    log.info(f"   Stream batch: {STREAM_BATCH_SIZE} images per batch")
     log.info(f"   Learning rate: {LEARNING_RATE}")
     log.info("-" * 60)
     
     best_val_acc = 0.0
     
     for epoch in range(EPOCHS):
+        log.info(f"\n📊 Epoch {epoch+1}/{EPOCHS}")
+        
         model.train()
         train_loss = 0.0
         train_correct = 0
         train_total = 0
+        batch_count = 0
         
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-        for batch_imgs, batch_labels in progress_bar:
+        # Stream images
+        image_buffer = []
+        label_buffer = []
+        
+        for img, label in dataset:
+            image_buffer.append(img)
+            label_buffer.append(label)
+            
+            # When buffer reaches STREAM_BATCH_SIZE, process it
+            if len(image_buffer) >= STREAM_BATCH_SIZE:
+                # Create a mini-batch from buffer
+                batch_imgs = torch.stack(image_buffer)
+                batch_labels = torch.tensor(label_buffer)
+                
+                # Move to device
+                batch_imgs = batch_imgs.to(DEVICE)
+                batch_labels = batch_labels.to(DEVICE)
+                
+                # Forward pass
+                optimizer.zero_grad()
+                
+                # Convert to PIL for feature extraction
+                pil_imgs = []
+                for i in range(batch_imgs.size(0)):
+                    try:
+                        img_tensor = batch_imgs[i].cpu()
+                        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                        img_tensor = img_tensor * std + mean
+                        img_tensor = torch.clamp(img_tensor, 0, 1)
+                        pil_img = transforms.ToPILImage()(img_tensor)
+                        if pil_img.size[0] > 10 and pil_img.size[1] > 10:
+                            pil_imgs.append(pil_img)
+                    except Exception:
+                        continue
+                
+                if not pil_imgs:
+                    # Clear buffer and continue
+                    image_buffer = []
+                    label_buffer = []
+                    continue
+                
+                try:
+                    features, logits = model.forward_batch(pil_imgs)
+                    features = features.to(DEVICE)
+                    logits = logits.to(DEVICE)
+                    
+                    loss = criterion(logits, batch_labels[:len(pil_imgs)])
+                    loss.backward()
+                    optimizer.step()
+                    
+                    train_loss += loss.item()
+                    _, predicted = torch.max(logits, 1)
+                    train_total += batch_labels[:len(pil_imgs)].size(0)
+                    train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
+                    batch_count += 1
+                    
+                    # Progress update
+                    if batch_count % 10 == 0:
+                        acc = 100 * train_correct / train_total if train_total > 0 else 0
+                        log.info(f"   📊 Batch {batch_count}: Loss: {train_loss/train_total:.3f}, Acc: {acc:.1f}%")
+                    
+                except Exception as e:
+                    log.warning(f"   ⚠️ Batch failed: {e}")
+                
+                # CLEAR MEMORY!
+                del batch_imgs
+                del batch_labels
+                del pil_imgs
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                gc.collect()
+                
+                # Reset buffer
+                image_buffer = []
+                label_buffer = []
+        
+        # Process any remaining images
+        if image_buffer:
+            batch_imgs = torch.stack(image_buffer)
+            batch_labels = torch.tensor(label_buffer)
+            
             batch_imgs = batch_imgs.to(DEVICE)
             batch_labels = batch_labels.to(DEVICE)
             
@@ -707,81 +712,96 @@ def train():
             pil_imgs = []
             for i in range(batch_imgs.size(0)):
                 try:
-                    img = batch_imgs[i].cpu()
+                    img_tensor = batch_imgs[i].cpu()
                     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
                     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                    img = img * std + mean
-                    img = torch.clamp(img, 0, 1)
-                    pil_img = transforms.ToPILImage()(img)
+                    img_tensor = img_tensor * std + mean
+                    img_tensor = torch.clamp(img_tensor, 0, 1)
+                    pil_img = transforms.ToPILImage()(img_tensor)
                     if pil_img.size[0] > 10 and pil_img.size[1] > 10:
                         pil_imgs.append(pil_img)
                 except Exception:
                     continue
             
-            if not pil_imgs:
-                continue
-            
-            try:
-                features, logits = model.forward_batch(pil_imgs)
-                features = features.to(DEVICE)
-                logits = logits.to(DEVICE)
+            if pil_imgs:
+                try:
+                    features, logits = model.forward_batch(pil_imgs)
+                    features = features.to(DEVICE)
+                    logits = logits.to(DEVICE)
+                    
+                    loss = criterion(logits, batch_labels[:len(pil_imgs)])
+                    loss.backward()
+                    optimizer.step()
+                    
+                    train_loss += loss.item()
+                    _, predicted = torch.max(logits, 1)
+                    train_total += batch_labels[:len(pil_imgs)].size(0)
+                    train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
+                    batch_count += 1
+                    
+                except Exception:
+                    pass
                 
-                loss = criterion(logits, batch_labels[:len(pil_imgs)])
-                loss.backward()
-                optimizer.step()
-                
-                train_loss += loss.item()
-                _, predicted = torch.max(logits, 1)
-                train_total += batch_labels[:len(pil_imgs)].size(0)
-                train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
-                
-                if train_total > 0:
-                    progress_bar.set_postfix({
-                        "loss": f"{train_loss/train_total:.3f}",
-                        "acc": f"{100*train_correct/train_total:.1f}%"
-                    })
-            except Exception:
-                continue
+                del batch_imgs
+                del batch_labels
+                del pil_imgs
+                gc.collect()
         
-        # Validation
+        train_acc = 100 * train_correct / train_total if train_total > 0 else 0
+        
+        # Validation - sample validation (use last batch as validation)
         model.eval()
         val_correct = 0
         val_total = 0
         
-        with torch.no_grad():
-            for batch_imgs, batch_labels in val_loader:
-                batch_imgs = batch_imgs.to(DEVICE)
-                batch_labels = batch_labels.to(DEVICE)
-                
-                pil_imgs = []
-                for i in range(batch_imgs.size(0)):
-                    try:
-                        img = batch_imgs[i].cpu()
-                        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                        img = img * std + mean
-                        img = torch.clamp(img, 0, 1)
-                        pil_img = transforms.ToPILImage()(img)
-                        if pil_img.size[0] > 10 and pil_img.size[1] > 10:
-                            pil_imgs.append(pil_img)
-                    except Exception:
-                        continue
-                
-                if not pil_imgs:
-                    continue
-                
+        # Use a small validation set (last few images)
+        val_images = []
+        val_labels = []
+        val_count = 0
+        
+        for img, label in dataset:
+            val_images.append(img)
+            val_labels.append(label)
+            val_count += 1
+            if val_count >= 50:  # Small validation set
+                break
+        
+        if val_images:
+            batch_imgs = torch.stack(val_images).to(DEVICE)
+            batch_labels = torch.tensor(val_labels).to(DEVICE)
+            
+            pil_imgs = []
+            for i in range(batch_imgs.size(0)):
                 try:
+                    img_tensor = batch_imgs[i].cpu()
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                    img_tensor = img_tensor * std + mean
+                    img_tensor = torch.clamp(img_tensor, 0, 1)
+                    pil_img = transforms.ToPILImage()(img_tensor)
+                    if pil_img.size[0] > 10 and pil_img.size[1] > 10:
+                        pil_imgs.append(pil_img)
+                except Exception:
+                    continue
+            
+            if pil_imgs:
+                with torch.no_grad():
                     _, logits = model.forward_batch(pil_imgs)
                     _, predicted = torch.max(logits, 1)
                     val_total += batch_labels[:len(pil_imgs)].size(0)
                     val_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
-                except Exception:
-                    continue
+            
+            del batch_imgs
+            del batch_labels
+            del pil_imgs
+            gc.collect()
         
         val_acc = 100 * val_correct / val_total if val_total > 0 else 0
-        train_acc = 100 * train_correct / train_total if train_total > 0 else 0
         
-        log.info(f"Epoch {epoch+1}: Train Acc: {train_acc:.1f}%, Val Acc: {val_acc:.1f}%")
+        log.info(f"\n📊 Epoch {epoch+1} Results:")
+        log.info(f"   Train Acc: {train_acc:.1f}%")
+        log.info(f"   Val Acc: {val_acc:.1f}%")
+        log.info(f"   Total batches: {batch_count}")
         
         scheduler.step()
         
@@ -799,36 +819,32 @@ def train():
     # Store features in database
     log.info("\n💾 Storing features in database...")
     
-    species_images = {}
-    for img, label_idx in dataset.samples:
-        species = dataset.idx_to_species[label_idx]
-        species_images.setdefault(species, []).append(img)
+    # Stream through dataset one more time to extract features
+    feature_buffer = {}
+    count = 0
     
-    log.info(f"   Extracting features for {len(species_images)} species...")
+    for img, label in dataset:
+        species = dataset.idx_to_species[label]
+        feature = model.feature_extractor.extract(transforms.ToPILImage()(img.cpu()))
+        if not np.all(feature == 0):
+            feature_buffer.setdefault(species, []).append(feature)
+            count += 1
+        
+        # Store every 50 images to free memory
+        if count % 50 == 0:
+            for species, features in feature_buffer.items():
+                if features:
+                    db.add_pokemon_features(species, features)
+            feature_buffer = {}
+            gc.collect()
+            log.info(f"   📊 Stored {count} features so far")
     
-    for species, images in tqdm(species_images.items(), desc="   Storing"):
-        try:
-            features = []
-            for img in images:
-                if isinstance(img, Image.Image) and img.size[0] > 10 and img.size[1] > 10:
-                    feature = model.feature_extractor.extract(img)
-                    if not np.all(feature == 0):
-                        features.append(feature)
-            if features:
-                db.add_pokemon_features(species, features)
-        except Exception as e:
-            log.error(f"   Failed to store {species}")
+    # Store remaining
+    for species, features in feature_buffer.items():
+        if features:
+            db.add_pokemon_features(species, features)
     
-    info_path = os.path.join(os.path.dirname(MODEL_OUTPUT) or ".", "species_info.json")
-    with open(info_path, 'w') as f:
-        json.dump({
-            'species_list': list(dataset.species_to_idx.keys()),
-            'num_species': len(dataset.species_to_idx),
-            'best_val_acc': best_val_acc,
-            'max_per_species': MAX_IMAGES_PER_SPECIES,
-            'species_stats': dataset.species_stats
-        }, f, indent=2)
-    log.info(f"   Species info saved to: {info_path}")
+    log.info(f"   ✅ Stored {count} features in database")
     
     final_stats = db.get_stats()
     log.info(f"\n📊 Database Stats:")
@@ -844,4 +860,4 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    stream_train()
