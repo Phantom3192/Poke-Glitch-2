@@ -77,7 +77,7 @@ TURSO_URL = os.getenv("TURSO_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))  # Increased for streaming
-STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "100"))  # Images per stream batch
+STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "25"))  # Images per stream batch - kept small so only one small chunk is ever in memory at a time
 EPOCHS = int(os.getenv("EPOCHS", "20"))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-4"))
 EARLY_STOP_ACC = float(os.getenv("EARLY_STOP_ACC", "95.0"))  # stop once train acc hits this %
@@ -88,6 +88,16 @@ DB_PATH = os.getenv("DB_PATH", "pokemon.db")
 AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "true"
 MAX_SPECIES = int(os.getenv("MAX_SPECIES", "100"))  # Max species to train
 MAX_IMAGES_PER_SPECIES = int(os.getenv("MAX_IMAGES_PER_SPECIES", "10"))
+# Hard cap on how many images get cached in RAM for reuse across epochs.
+# Each cached image is a 224x224x3 uint8 tensor (~150KB). Default 8000
+# images caps the cache at ~1.2GB, which should be safe on most small
+# Railway instances. Images beyond this cap still get used for training
+# in epoch 1, they just aren't kept in memory - so if you hit the cap,
+# epoch 2+ will train on a smaller (but still random/representative)
+# subset instead of the full dataset. Raise this if your container has
+# more RAM to spare; set to 0 to disable caching entirely (every epoch
+# re-streams from Hugging Face - slower, but flat memory usage).
+MAX_CACHE_IMAGES = int(os.getenv("MAX_CACHE_IMAGES", "0"))
 
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
@@ -389,13 +399,20 @@ class StreamingPokemonDataset(IterableDataset):
     
     def __init__(self, extra_dir: str = "Extra pokemons"):
         self.extra_dir = extra_dir
+        # NOTE: intentionally stops short of ToTensor+Normalize here. Every
+        # image produced by this transform gets cached in self._cache for
+        # reuse across epochs (see __iter__), so we store it as a uint8
+        # tensor (raw 0-255 pixels) instead of a normalized float32 tensor.
+        # That's a 4x memory cut (1 byte/channel vs 4 bytes/channel) with
+        # ~28k images this is the difference between ~16.8GB and ~4.2GB
+        # of cache. Normalization is applied later, per-batch, right before
+        # the forward pass (see _to_normalized_float below).
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomRotation(10),
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.PILToTensor(),  # uint8, CHW, values 0-255
         ])
         
         # Cache of (tensor, label) collected on the first pass, reused for
@@ -514,13 +531,24 @@ class StreamingPokemonDataset(IterableDataset):
         target_total = len(self.species_to_idx) * MAX_IMAGES_PER_SPECIES
         species_counts: Dict[str, int] = {}
         collected = 0
+        cache_capped_warned = False
         t_start = time.time()
         
         def _emit(tensor, label, species):
-            nonlocal collected
+            nonlocal collected, cache_capped_warned
             species_counts[species] = species_counts.get(species, 0) + 1
             collected += 1
-            self._cache.append((tensor, label))
+            # Cap cache growth so a large run can't OOM the container.
+            # Images beyond the cap still get trained on this epoch (via
+            # the yield below), they just aren't retained for epoch 2+.
+            if MAX_CACHE_IMAGES <= 0 or len(self._cache) < MAX_CACHE_IMAGES:
+                self._cache.append((tensor, label))
+            elif not cache_capped_warned:
+                cache_capped_warned = True
+                log.warning(f"   ⚠️ Cache cap ({MAX_CACHE_IMAGES} images) reached - "
+                            f"later epochs will replay only the cached subset, "
+                            f"not the full {target_total}-image target. Raise "
+                            f"MAX_CACHE_IMAGES if you have RAM to spare.")
             return tensor, label
         
         # First, yield local images
@@ -644,6 +672,27 @@ class StreamingPokemonDataset(IterableDataset):
 
 
 # ============ STREAMING TRAINER ============
+
+def store_chunk_features_to_db(features_tensor, batch_labels, idx_to_species: Dict[int, str], db):
+    """
+    Saves the features for a chunk that was JUST trained on, straight to
+    the DB, using the features already computed during that chunk's
+    forward pass (no extra model call needed). Called right after every
+    small chunk so results are persisted and the chunk can be dropped
+    from memory immediately - nothing waits until end-of-epoch.
+    """
+    feature_buffer: Dict[str, List[np.ndarray]] = {}
+    feats_np = features_tensor.detach().cpu().numpy()
+    labels_list = batch_labels.detach().cpu().tolist()
+    for feat, lbl in zip(feats_np, labels_list):
+        if not np.all(feat == 0):
+            species = idx_to_species.get(lbl)
+            if species:
+                feature_buffer.setdefault(species, []).append(feat)
+    for species, feats in feature_buffer.items():
+        if feats:
+            db.add_pokemon_features(species, feats)
+
 
 def store_features_to_db(model, dataset, db, label="checkpoint"):
     """
@@ -793,16 +842,14 @@ def stream_train():
                 # Forward pass
                 optimizer.zero_grad()
                 
-                # Convert to PIL for feature extraction
+                # Convert to PIL for feature extraction. Cached tensors are
+                # raw uint8 (see StreamingPokemonDataset.transform) so no
+                # un-normalize step is needed - ToPILImage handles uint8
+                # CHW tensors directly.
                 pil_imgs = []
                 for i in range(batch_imgs.size(0)):
                     try:
-                        img_tensor = batch_imgs[i].cpu()
-                        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                        img_tensor = img_tensor * std + mean
-                        img_tensor = torch.clamp(img_tensor, 0, 1)
-                        pil_img = transforms.ToPILImage()(img_tensor)
+                        pil_img = transforms.ToPILImage()(batch_imgs[i].cpu())
                         if pil_img.size[0] > 10 and pil_img.size[1] > 10:
                             pil_imgs.append(pil_img)
                     except Exception:
@@ -814,6 +861,7 @@ def stream_train():
                     label_buffer = []
                     continue
                 
+                features, logits = None, None
                 try:
                     features, logits = model.forward_batch(pil_imgs)
                     features = features.to(DEVICE)
@@ -828,6 +876,12 @@ def stream_train():
                     train_total += batch_labels[:len(pil_imgs)].size(0)
                     train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
                     batch_count += 1
+                    
+                    # Save this chunk's results to the DB right away, then
+                    # it's safe to drop from memory below - nothing about
+                    # this chunk needs to be revisited later.
+                    store_chunk_features_to_db(features, batch_labels[:len(pil_imgs)],
+                                                dataset.idx_to_species, db)
                     
                     # Progress update (every batch — cheap now that images are cached)
                     acc = 100 * train_correct / train_total if train_total > 0 else 0
@@ -851,6 +905,7 @@ def stream_train():
                 del batch_imgs
                 del batch_labels
                 del pil_imgs
+                del features, logits
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 gc.collect()
                 
@@ -871,12 +926,7 @@ def stream_train():
             pil_imgs = []
             for i in range(batch_imgs.size(0)):
                 try:
-                    img_tensor = batch_imgs[i].cpu()
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                    img_tensor = img_tensor * std + mean
-                    img_tensor = torch.clamp(img_tensor, 0, 1)
-                    pil_img = transforms.ToPILImage()(img_tensor)
+                    pil_img = transforms.ToPILImage()(batch_imgs[i].cpu())
                     if pil_img.size[0] > 10 and pil_img.size[1] > 10:
                         pil_imgs.append(pil_img)
                 except Exception:
@@ -897,6 +947,12 @@ def stream_train():
                     train_total += batch_labels[:len(pil_imgs)].size(0)
                     train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
                     batch_count += 1
+                    
+                    # Same as the main loop: persist this last chunk's
+                    # results immediately rather than waiting for an
+                    # end-of-epoch save.
+                    store_chunk_features_to_db(features, batch_labels[:len(pil_imgs)],
+                                                dataset.idx_to_species, db)
                     
                 except Exception:
                     pass
@@ -932,12 +988,7 @@ def stream_train():
             pil_imgs = []
             for i in range(batch_imgs.size(0)):
                 try:
-                    img_tensor = batch_imgs[i].cpu()
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                    img_tensor = img_tensor * std + mean
-                    img_tensor = torch.clamp(img_tensor, 0, 1)
-                    pil_img = transforms.ToPILImage()(img_tensor)
+                    pil_img = transforms.ToPILImage()(batch_imgs[i].cpu())
                     if pil_img.size[0] > 10 and pil_img.size[1] > 10:
                         pil_imgs.append(pil_img)
                 except Exception:
