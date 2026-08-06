@@ -7,3 +7,4 @@ tqdm>=4.65.0
 datasets>=2.14.0
 python-dotenv>=1.0.0
 libsql-experimental>=0.0.3
+rarfile>=4.0  # ← Added for RAR support
