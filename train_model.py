@@ -1,7 +1,7 @@
 """
 train_model.py - Complete AI Pokémon Trainer for Railway
 Supports: ZIP, RAR (with automatic unrar fallback)
-Fetches from Hugging Face + your extra Pokémon
+Fetches from Hugging Face (with HF_TOKEN) + your extra Pokémon
 Trains model, stores in database
 """
 
@@ -35,6 +35,7 @@ from tqdm import tqdm
 # Environment variables (Railway will set these)
 TURSO_URL = os.getenv("TURSO_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")  # ← Added HF_TOKEN support
 MAX_IMAGES_PER_SPECIES = int(os.getenv("MAX_IMAGES_PER_SPECIES", "10"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 EPOCHS = int(os.getenv("EPOCHS", "20"))
@@ -43,6 +44,13 @@ DATASET_NAME = os.getenv("DATASET_NAME", "SpreadSheets/Poketwo-Spawn-Images")
 MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
 AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "true"
+
+# Set Hugging Face token for authentication
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    log.info(f"🔑 HF_TOKEN configured (length: {len(HF_TOKEN)})")
+else:
+    log.warning("⚠️ HF_TOKEN not set. You may have rate limits. Get token from: https://huggingface.co/settings/tokens")
 
 # Device
 DEVICE = torch.device("cpu")
@@ -571,12 +579,21 @@ class PokemonDataset(Dataset):
         self._print_stats()
     
     def _load_huggingface(self):
-        """Load images from Hugging Face dataset."""
+        """Load images from Hugging Face dataset with HF_TOKEN authentication."""
         log.info(f"📥 Attempting to load Hugging Face dataset: {DATASET_NAME}")
         
         try:
             from datasets import load_dataset
-            ds = load_dataset(DATASET_NAME, split="train", streaming=True)
+            
+            # Use HF_TOKEN for authentication if available
+            load_kwargs = {"split": "train", "streaming": True}
+            
+            if HF_TOKEN:
+                log.info(f"   🔑 Using HF_TOKEN for authentication")
+                # The datasets library will automatically use HF_TOKEN from environment
+                # We already set os.environ["HF_TOKEN"] at the top
+            
+            ds = load_dataset(DATASET_NAME, **load_kwargs)
             
             # Detect columns
             features = ds.features
@@ -601,6 +618,10 @@ class PokemonDataset(Dataset):
             
             species_counts = {}
             count = 0
+            
+            # Get species list first to filter
+            species_set = set(self.species_to_idx.keys())
+            
             for row in ds:
                 try:
                     raw_label = row[label_col]
@@ -608,7 +629,9 @@ class PokemonDataset(Dataset):
                         raw_label = features[label_col].int2str(raw_label)
                     
                     species = str(raw_label).strip().lower()
-                    if species not in self.species_to_idx:
+                    
+                    # Only keep species we care about (from extra pokemons)
+                    if species not in species_set:
                         continue
                     
                     if species_counts.get(species, 0) >= self.max_per_species:
@@ -629,17 +652,26 @@ class PokemonDataset(Dataset):
                 except Exception as e:
                     continue
                 
-                if count > 1000:  # Limit for speed
+                # Stop after we have enough images
+                if count > 1000:
                     break
             
             self.species_stats.update(species_counts)
             log.info(f"   ✅ Loaded {len(self.samples)} samples from Hugging Face")
             return True
             
+        except ImportError as e:
+            log.warning(f"   ⚠️ datasets library not installed: {e}")
         except Exception as e:
             log.warning(f"   ⚠️ Failed to load Hugging Face dataset: {e}")
-            log.warning(f"   Will use only local extra Pokémon images")
-            return False
+            if "401" in str(e) or "Unauthorized" in str(e):
+                log.warning(f"   🔑 Authentication error! Please set HF_TOKEN in environment variables.")
+                log.warning(f"   Get your token at: https://huggingface.co/settings/tokens")
+            elif "429" in str(e):
+                log.warning(f"   ⚠️ Rate limited! HF_TOKEN would help with higher limits.")
+        
+        log.warning(f"   Will use only local extra Pokémon images")
+        return False
     
     def _load_extra_pokemon(self, extra_dir: str):
         """Load extra Pokémon from local folder."""
@@ -759,8 +791,14 @@ def train():
     log.info("🚀 Pokémon AI Trainer")
     log.info("=" * 60)
     
+    # Show HF_TOKEN status
+    if HF_TOKEN:
+        log.info(f"🔑 HF_TOKEN: ✅ Set (length: {len(HF_TOKEN)})")
+    else:
+        log.warning(f"🔑 HF_TOKEN: ❌ Not set - Get from https://huggingface.co/settings/tokens")
+    
     # Extract any archive files
-    log.info("📦 Checking for archive files (ZIP, RAR, 7z, TAR)...")
+    log.info("\n📦 Checking for archive files (ZIP, RAR, 7z, TAR)...")
     extract_archive_files()
     
     # Initialize database
