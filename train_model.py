@@ -30,12 +30,19 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 
+# ============ SETUP LOGGING FIRST ============
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+log = logging.getLogger("trainer")
+
 # ============ CONFIGURATION ============
 
 # Environment variables (Railway will set these)
 TURSO_URL = os.getenv("TURSO_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
-HF_TOKEN = os.getenv("HF_TOKEN")  # ← Added HF_TOKEN support
+HF_TOKEN = os.getenv("HF_TOKEN")  # Hugging Face token
 MAX_IMAGES_PER_SPECIES = int(os.getenv("MAX_IMAGES_PER_SPECIES", "10"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 EPOCHS = int(os.getenv("EPOCHS", "20"))
@@ -45,7 +52,7 @@ MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
 AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "true"
 
-# Set Hugging Face token for authentication
+# Set Hugging Face token for authentication (AFTER log is defined)
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
     log.info(f"🔑 HF_TOKEN configured (length: {len(HF_TOKEN)})")
@@ -55,13 +62,6 @@ else:
 # Device
 DEVICE = torch.device("cpu")
 torch.set_num_threads(os.cpu_count() or 4)
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-log = logging.getLogger("trainer")
 
 # ============ ARCHIVE EXTRACTION ============
 
