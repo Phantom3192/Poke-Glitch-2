@@ -20,51 +20,29 @@ from typing import Dict, List, Optional, Tuple, Any
 from io import BytesIO
 
 # ============ COMPLETE LOG SUPPRESSION ============
-# Must be done BEFORE importing any other modules
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["DATASETS_VERBOSITY"] = "error"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_HUB_VERBOSITY"] = "error"
 
-# Suppress ALL logging from other libraries
 import warnings
 warnings.filterwarnings("ignore")
 
-# Setup logging BEFORE any other imports that might create loggers
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 log = logging.getLogger("trainer")
 
-# Now suppress everything else
-logging.getLogger().setLevel(logging.WARNING)
+# Suppress external loggers
 for logger_name in [
-    "urllib3",
-    "requests",
-    "datasets",
-    "huggingface_hub",
-    "filelock",
-    "transformers",
-    "torch",
-    "torchvision",
-    "PIL",
-    "matplotlib",
-    "tensorflow",
-    "absl",
+    "urllib3", "requests", "datasets", "huggingface_hub",
+    "filelock", "transformers", "torch", "torchvision",
 ]:
     logging.getLogger(logger_name).setLevel(logging.ERROR)
     logging.getLogger(logger_name).disabled = True
 
-# Also suppress HTTP connection messages from urllib3
-try:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except:
-    pass
-
-# Now import everything else
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -90,19 +68,16 @@ MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
 AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "true"
 
-# Set Hugging Face token
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
     log.info(f"🔑 HF_TOKEN configured")
 
-# Device
 DEVICE = torch.device("cpu")
 torch.set_num_threads(os.cpu_count() or 4)
 
 # ============ ARCHIVE EXTRACTION ============
 
 def extract_archive_files():
-    """Extract ZIP and RAR archive files."""
     if not AUTO_EXTRACT_ARCHIVES:
         return
     
@@ -131,7 +106,6 @@ def extract_archive_files():
                 log.info(f"   📂 Extracting ZIP: {archive_path.name}")
                 with zipfile.ZipFile(archive_path, 'r') as zip_ref:
                     zip_ref.extractall(temp_dir)
-            
             elif ext in ['.rar']:
                 log.info(f"   📂 Extracting RAR: {archive_path.name}")
                 try:
@@ -141,7 +115,6 @@ def extract_archive_files():
                 except:
                     subprocess.run(['unrar', 'x', '-y', str(archive_path), str(temp_dir)], 
                                  capture_output=True, check=False)
-            
             elif ext in ['.7z']:
                 log.info(f"   📂 Extracting 7z: {archive_path.name}")
                 try:
@@ -152,7 +125,6 @@ def extract_archive_files():
                     subprocess.run(['7z', 'x', '-y', str(archive_path), f'-o{temp_dir}'], 
                                  capture_output=True, check=False)
             
-            # Process extracted files
             extracted = process_extracted_files(temp_dir, extra_dir)
             extracted_count += extracted
             
@@ -172,9 +144,7 @@ def extract_archive_files():
 
 
 def process_extracted_files(temp_dir: Path, extra_dir: Path) -> int:
-    """Process extracted files and organize them into species folders."""
     extracted_count = 0
-    
     valid_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.PNG', '.JPG', '.JPEG', '.WEBP'}
     
     for root, dirs, files in os.walk(temp_dir):
@@ -206,8 +176,6 @@ def process_extracted_files(temp_dir: Path, extra_dir: Path) -> int:
 # ============ DATABASE LAYER ============
 
 class Database:
-    """Simple database with Turso or SQLite fallback."""
-    
     def __init__(self):
         self.use_turso = False
         self._conn = None
@@ -218,7 +186,7 @@ class Database:
                 self._conn = libsql.connect(TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
                 self.use_turso = True
                 log.info(f"✅ Connected to Turso database")
-            except Exception as e:
+            except Exception:
                 log.warning(f"Turso connection failed, using SQLite fallback")
         
         if not self.use_turso:
@@ -299,41 +267,73 @@ class PokemonFeatureExtractor(nn.Module):
         self.backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
         self.backbone.classifier = nn.Identity()
         backbone_dim = 1280
+        
         self.projection = nn.Sequential(
             nn.Linear(backbone_dim, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim),
         )
+        
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
         ])
+        
         self.to(DEVICE)
         self.eval()
     
     @torch.no_grad()
     def extract(self, img: Image.Image) -> np.ndarray:
-        img_tensor = self.transform(img).unsqueeze(0).to(DEVICE)
-        img_tensor = self.normalize(img_tensor)
-        features = self.backbone(img_tensor)
-        features = F.adaptive_avg_pool2d(features, (1, 1)).flatten(1)
-        projected = self.projection(features)
-        projected = F.normalize(projected, p=2, dim=1)
-        return projected.cpu().numpy().flatten()
+        """Extract feature vector from a single image."""
+        if img is None:
+            return np.zeros(256)
+        
+        try:
+            img_tensor = self.transform(img).unsqueeze(0).to(DEVICE)
+            img_tensor = self.normalize(img_tensor)
+            features = self.backbone(img_tensor)
+            features = F.adaptive_avg_pool2d(features, (1, 1)).flatten(1)
+            projected = self.projection(features)
+            projected = F.normalize(projected, p=2, dim=1)
+            return projected.cpu().numpy().flatten()
+        except Exception as e:
+            log.warning(f"Feature extraction failed: {e}")
+            return np.zeros(256)
     
     @torch.no_grad()
     def extract_batch(self, images: List[Image.Image]) -> np.ndarray:
-        batch = []
+        """Extract features from multiple images."""
+        valid_images = []
         for img in images:
-            batch.append(self.transform(img).unsqueeze(0))
-        batch_tensor = torch.cat(batch, dim=0).to(DEVICE)
-        batch_tensor = self.normalize(batch_tensor)
-        features = self.backbone(batch_tensor)
-        features = F.adaptive_avg_pool2d(features, (1, 1)).flatten(1)
-        projected = self.projection(features)
-        projected = F.normalize(projected, p=2, dim=1)
-        return projected.cpu().numpy()
+            if img is not None and isinstance(img, Image.Image):
+                try:
+                    valid_images.append(self.transform(img).unsqueeze(0))
+                except Exception:
+                    continue
+        
+        if not valid_images:
+            log.warning("No valid images in batch")
+            return np.zeros((len(images), 256))
+        
+        try:
+            batch_tensor = torch.cat(valid_images, dim=0).to(DEVICE)
+            batch_tensor = self.normalize(batch_tensor)
+            features = self.backbone(batch_tensor)
+            features = F.adaptive_avg_pool2d(features, (1, 1)).flatten(1)
+            projected = self.projection(features)
+            projected = F.normalize(projected, p=2, dim=1)
+            
+            # If we dropped some images, pad the result
+            result = projected.cpu().numpy()
+            if len(valid_images) < len(images):
+                padded = np.zeros((len(images), result.shape[1]))
+                padded[:len(valid_images)] = result
+                return padded
+            return result
+        except Exception as e:
+            log.warning(f"Batch feature extraction failed: {e}")
+            return np.zeros((len(images), 256))
 
 
 class PokemonClassifier(nn.Module):
@@ -383,20 +383,17 @@ class PokemonDataset(Dataset):
         self._print_stats()
     
     def _load_huggingface(self):
-        """Load images from Hugging Face dataset with progress checkpoints."""
         log.info(f"📥 Loading Hugging Face dataset...")
         
         try:
             from datasets import load_dataset
             
-            # Completely suppress dataset logs
             import warnings
             warnings.filterwarnings("ignore")
             logging.getLogger("datasets").setLevel(logging.ERROR)
             
             ds = load_dataset(DATASET_NAME, split="train", streaming=True)
             
-            # Detect columns
             features = ds.features
             label_col = None
             image_col = None
@@ -440,19 +437,21 @@ class PokemonDataset(Dataset):
                     if not isinstance(img, Image.Image):
                         img = Image.open(BytesIO(img))
                     
+                    # Verify image is valid
+                    if img.size[0] < 10 or img.size[1] < 10:
+                        continue
+                    
                     self.samples.append((img, self.species_to_idx[species]))
                     self.species_images.setdefault(species, []).append(img)
                     species_counts[species] = species_counts.get(species, 0) + 1
                     count += 1
                     
-                    # CHECKPOINT: Report every 100 images
                     if count % 100 == 0:
                         log.info(f"   📊 Checkpoint: {count} images loaded from Hugging Face")
                     
-                except Exception:
+                except Exception as e:
                     continue
                 
-                # Stop after we have enough
                 if count > 1000:
                     break
             
@@ -503,6 +502,8 @@ class PokemonDataset(Dataset):
             for img_path in images:
                 try:
                     img = Image.open(img_path).convert("RGB")
+                    if img.size[0] < 10 or img.size[1] < 10:
+                        continue
                     self.samples.append((img, self.species_to_idx[species]))
                     self.species_images.setdefault(species, []).append(img)
                     species_counts[species] = species_counts.get(species, 0) + 1
@@ -527,7 +528,6 @@ class PokemonDataset(Dataset):
             log.info(f"   Min per species: {min(counts)}")
             log.info(f"   Max per species: {max(counts)}")
         
-        # Show species with low counts
         low_species = [s for s, c in self.species_stats.items() if c < 3]
         if low_species:
             log.warning(f"\n⚠️ {len(low_species)} species have < 3 images:")
@@ -535,6 +535,9 @@ class PokemonDataset(Dataset):
                 log.warning(f"   - {s}: {self.species_stats[s]} images")
             if len(low_species) > 5:
                 log.warning(f"   ... and {len(low_species) - 5} more")
+        
+        if len(self.samples) < 10:
+            log.error("❌ Too few samples! Need at least 10 images to train.")
         
         log.info("=" * 60)
     
@@ -555,24 +558,20 @@ def train():
     log.info("🚀 Pokémon AI Trainer")
     log.info("=" * 60)
     
-    # Show HF_TOKEN status
     if HF_TOKEN:
         log.info(f"🔑 HF_TOKEN: ✅ Set")
     else:
-        log.warning(f"🔑 HF_TOKEN: ❌ Not set - Get from https://huggingface.co/settings/tokens")
+        log.warning(f"🔑 HF_TOKEN: ❌ Not set")
     
-    # Extract archives
     log.info("\n📦 Checking for archive files...")
     extract_archive_files()
     
-    # Initialize database
     log.info("\n📂 Connecting to database...")
     db = Database()
     stats = db.get_stats()
     log.info(f"   Existing species: {stats['total_species']}")
     log.info(f"   Existing features: {stats['total_features']}")
     
-    # Check for extra Pokémon
     extra_path = Path("Extra pokemons")
     extra_species = []
     if extra_path.exists():
@@ -594,11 +593,9 @@ def train():
     all_species = sorted(extra_species)
     log.info(f"   Total species: {len(all_species)}")
     
-    # Create mapping
     species_to_idx = {s: i for i, s in enumerate(all_species)}
     idx_to_species = {i: s for s, i in species_to_idx.items()}
     
-    # Create dataset
     log.info("\n📂 Creating dataset...")
     dataset = PokemonDataset(
         species_to_idx=species_to_idx,
@@ -610,7 +607,10 @@ def train():
         log.error("❌ No samples loaded! Exiting.")
         return
     
-    # Split dataset
+    if len(dataset) < 10:
+        log.error("❌ Too few samples! Need at least 10 images to train.")
+        return
+    
     val_size = max(1, int(len(dataset) * 0.1))
     train_size = len(dataset) - val_size
     
@@ -619,33 +619,30 @@ def train():
         generator=torch.Generator().manual_seed(42)
     )
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=min(BATCH_SIZE, train_size), shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=min(BATCH_SIZE, val_size), shuffle=False, num_workers=0)
     
     log.info(f"\n📊 Dataset split:")
     log.info(f"   Train samples: {train_size}")
     log.info(f"   Val samples: {val_size}")
     
-    # Initialize model
     log.info("\n🧠 Initializing model...")
     model = PokemonClassifier(num_species=len(all_species))
     model.to(DEVICE)
     model.feature_extractor.eval()
     
-    # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.classifier.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     
     log.info(f"\n🎯 Training for {EPOCHS} epochs...")
-    log.info(f"   Batch size: {BATCH_SIZE}")
+    log.info(f"   Batch size: {min(BATCH_SIZE, train_size)}")
     log.info(f"   Learning rate: {LEARNING_RATE}")
     log.info("-" * 60)
     
     best_val_acc = 0.0
     
     for epoch in range(EPOCHS):
-        # Training
         model.train()
         train_loss = 0.0
         train_correct = 0
@@ -660,31 +657,43 @@ def train():
             
             pil_imgs = []
             for i in range(batch_imgs.size(0)):
-                img = batch_imgs[i].cpu()
-                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                img = img * std + mean
-                img = torch.clamp(img, 0, 1)
-                img = transforms.ToPILImage()(img)
-                pil_imgs.append(img)
+                try:
+                    img = batch_imgs[i].cpu()
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                    img = img * std + mean
+                    img = torch.clamp(img, 0, 1)
+                    pil_img = transforms.ToPILImage()(img)
+                    if pil_img.size[0] > 10 and pil_img.size[1] > 10:
+                        pil_imgs.append(pil_img)
+                except Exception as e:
+                    continue
             
-            features, logits = model.forward_batch(pil_imgs)
-            features = features.to(DEVICE)
-            logits = logits.to(DEVICE)
+            if not pil_imgs:
+                log.warning("No valid images in batch, skipping...")
+                continue
             
-            loss = criterion(logits, batch_labels)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-            _, predicted = torch.max(logits, 1)
-            train_total += batch_labels.size(0)
-            train_correct += (predicted == batch_labels).sum().item()
-            
-            progress_bar.set_postfix({
-                "loss": f"{train_loss/train_total:.3f}",
-                "acc": f"{100*train_correct/train_total:.1f}%"
-            })
+            try:
+                features, logits = model.forward_batch(pil_imgs)
+                features = features.to(DEVICE)
+                logits = logits.to(DEVICE)
+                
+                loss = criterion(logits, batch_labels[:len(pil_imgs)])
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item()
+                _, predicted = torch.max(logits, 1)
+                train_total += batch_labels[:len(pil_imgs)].size(0)
+                train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
+                
+                progress_bar.set_postfix({
+                    "loss": f"{train_loss/train_total:.3f}" if train_total > 0 else "0.000",
+                    "acc": f"{100*train_correct/train_total:.1f}%" if train_total > 0 else "0.0%"
+                })
+            except Exception as e:
+                log.warning(f"Batch training failed: {e}")
+                continue
         
         # Validation
         model.eval()
@@ -698,21 +707,31 @@ def train():
                 
                 pil_imgs = []
                 for i in range(batch_imgs.size(0)):
-                    img = batch_imgs[i].cpu()
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                    img = img * std + mean
-                    img = torch.clamp(img, 0, 1)
-                    img = transforms.ToPILImage()(img)
-                    pil_imgs.append(img)
+                    try:
+                        img = batch_imgs[i].cpu()
+                        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                        img = img * std + mean
+                        img = torch.clamp(img, 0, 1)
+                        pil_img = transforms.ToPILImage()(img)
+                        if pil_img.size[0] > 10 and pil_img.size[1] > 10:
+                            pil_imgs.append(pil_img)
+                    except Exception:
+                        continue
                 
-                _, logits = model.forward_batch(pil_imgs)
-                _, predicted = torch.max(logits, 1)
-                val_total += batch_labels.size(0)
-                val_correct += (predicted == batch_labels).sum().item()
+                if not pil_imgs:
+                    continue
+                
+                try:
+                    _, logits = model.forward_batch(pil_imgs)
+                    _, predicted = torch.max(logits, 1)
+                    val_total += batch_labels[:len(pil_imgs)].size(0)
+                    val_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
+                except Exception:
+                    continue
         
         val_acc = 100 * val_correct / val_total if val_total > 0 else 0
-        train_acc = 100 * train_correct / train_total
+        train_acc = 100 * train_correct / train_total if train_total > 0 else 0
         
         log.info(f"Epoch {epoch+1}: Train Acc: {train_acc:.1f}%, Val Acc: {val_acc:.1f}%")
         
@@ -729,7 +748,6 @@ def train():
     log.info(f"   Best validation accuracy: {best_val_acc:.1f}%")
     log.info(f"   Model saved to: {MODEL_OUTPUT}")
     
-    # Store features in database
     log.info("\n💾 Storing features in database...")
     
     species_images = {}
@@ -743,15 +761,15 @@ def train():
         try:
             features = []
             for img in images:
-                if isinstance(img, Image.Image):
+                if isinstance(img, Image.Image) and img.size[0] > 10 and img.size[1] > 10:
                     feature = model.feature_extractor.extract(img)
-                    features.append(feature)
+                    if not np.all(feature == 0):
+                        features.append(feature)
             if features:
                 db.add_pokemon_features(species, features)
         except Exception as e:
             log.error(f"   Failed to store {species}: {e}")
     
-    # Save species info
     info_path = os.path.join(os.path.dirname(MODEL_OUTPUT) or ".", "species_info.json")
     with open(info_path, 'w') as f:
         json.dump({
