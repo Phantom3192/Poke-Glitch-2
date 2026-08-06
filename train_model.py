@@ -1,6 +1,6 @@
 """
 train_model.py - Complete AI Pokémon Trainer for Railway
-ALL HTTP LOGS SUPPRESSED - Nuclear option
+Trains on: Your ZIP images + ALL Pokémon from Hugging Face dataset
 """
 
 import os
@@ -18,13 +18,9 @@ from typing import Dict, List, Optional, Tuple, Any
 from io import BytesIO
 
 # ============ NUCLEAR LOG SUPPRESSION ============
-# Must be done BEFORE importing ANYTHING that creates logs
-
-# 1. Kill all logging before it starts
 logging.root.handlers = []
 logging.basicConfig = lambda *args, **kwargs: None
 
-# 2. Suppress all environment variables that enable logging
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["DATASETS_VERBOSITY"] = "error"
@@ -34,38 +30,22 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["GRPC_VERBOSITY"] = "ERROR"
 
-# 3. Suppress warnings
 import warnings
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")
 
-# 4. Kill urllib3 logging
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except:
     pass
 
-# 5. Monkey patch requests to prevent logging
-try:
-    import requests
-    original_request = requests.Session.request
-    def silent_request(self, method, url, **kwargs):
-        kwargs['timeout'] = kwargs.get('timeout', 30)
-        return original_request(self, method, url, **kwargs)
-    requests.Session.request = silent_request
-except:
-    pass
-
-# 6. Disable all loggers
 for name in logging.root.manager.loggerDict.keys():
     logging.getLogger(name).disabled = True
     logging.getLogger(name).setLevel(logging.CRITICAL)
 
-# 7. Redirect stdout/stderr for datasets/huggingface
 sys.stderr = open(os.devnull, 'w') if not os.getenv("DEBUG") else sys.stderr
 
-# 8. Now import everything else (logs will be silent)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -77,30 +57,18 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 
-# 9. Create our own logger (only we control)
+# ============ SILENT LOGGER ============
 class SilentLogger:
-    def __init__(self):
-        self.level = "INFO"
-    
     def info(self, msg, *args, **kwargs):
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} INFO {msg}")
-    
     def warning(self, msg, *args, **kwargs):
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} WARNING {msg}")
-    
     def error(self, msg, *args, **kwargs):
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ERROR {msg}")
-    
     def debug(self, msg, *args, **kwargs):
         pass
 
 log = SilentLogger()
-
-# 10. Now suppress all external loggers again (after imports)
-import logging
-for name in logging.root.manager.loggerDict.keys():
-    logging.getLogger(name).disabled = True
-    logging.getLogger(name).setLevel(logging.CRITICAL)
 
 # ============ CONFIGURATION ============
 
@@ -108,6 +76,7 @@ TURSO_URL = os.getenv("TURSO_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
 MAX_IMAGES_PER_SPECIES = int(os.getenv("MAX_IMAGES_PER_SPECIES", "10"))
+MAX_TOTAL_IMAGES = int(os.getenv("MAX_TOTAL_IMAGES", "5000"))  # NEW: Max total images from dataset
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 EPOCHS = int(os.getenv("EPOCHS", "20"))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-4"))
@@ -396,15 +365,18 @@ class PokemonClassifier(nn.Module):
         return features_tensor, logits
 
 
-# ============ DATASET ============
+# ============ DATASET - TRAIN ALL POKEMON ============
 
 class PokemonDataset(Dataset):
-    def __init__(self, species_to_idx: Dict[str, int], max_per_species: int = 10, extra_dir: str = "Extra pokemons"):
-        self.species_to_idx = species_to_idx
+    """Dataset that trains on ALL Pokémon from Hugging Face + your extras."""
+    
+    def __init__(self, extra_dir: str = "Extra pokemons", max_per_species: int = 10):
         self.max_per_species = max_per_species
         self.samples = []
         self.species_stats = {}
         self.species_images = {}
+        self.species_to_idx = {}
+        self.idx_to_species = {}
         
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -415,24 +387,25 @@ class PokemonDataset(Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
-        # Load from Hugging Face - SILENTLY
-        self._load_huggingface_silent()
+        # Step 1: Load ALL Pokémon from Hugging Face
+        self._load_all_from_huggingface()
         
-        # Load local extras
+        # Step 2: Load your extra Pokémon (overwrites/extends)
         self._load_extra_pokemon(extra_dir)
+        
+        # Step 3: Build species mapping
+        self._build_species_mapping()
         
         random.shuffle(self.samples)
         self._print_stats()
     
-    def _load_huggingface_silent(self):
-        """Load images from Hugging Face - COMPLETELY SILENT"""
-        log.info(f"📥 Loading Hugging Face dataset...")
+    def _load_all_from_huggingface(self):
+        """Load ALL Pokémon from Hugging Face dataset (no filtering!)."""
+        log.info(f"📥 Loading ALL Pokémon from Hugging Face dataset...")
         
         try:
-            # Import datasets - this will log but we've silenced it
             from datasets import load_dataset
             
-            # Completely suppress any remaining logs
             with open(os.devnull, 'w') as devnull:
                 old_stdout = sys.stdout
                 old_stderr = sys.stderr
@@ -463,13 +436,17 @@ class PokemonDataset(Dataset):
                 label_col = list(features.keys())[0]
                 image_col = list(features.keys())[1] if len(features) > 1 else list(features.keys())[0]
             
-            species_set = set(self.species_to_idx.keys())
+            log.info(f"   Label column: {label_col}, Image column: {image_col}")
+            
             species_counts = {}
             count = 0
+            total_processed = 0
             
-            log.info(f"   🔄 Scanning dataset for matching species...")
+            log.info(f"   🔄 Scanning dataset for ALL species...")
             
             for row in ds:
+                total_processed += 1
+                
                 try:
                     raw_label = row[label_col]
                     if isinstance(raw_label, int):
@@ -477,8 +454,7 @@ class PokemonDataset(Dataset):
                     
                     species = str(raw_label).strip().lower()
                     
-                    if species not in species_set:
-                        continue
+                    # Skip if we already have enough
                     if species_counts.get(species, 0) >= self.max_per_species:
                         continue
                     
@@ -492,29 +468,30 @@ class PokemonDataset(Dataset):
                     if img.size[0] < 10 or img.size[1] < 10:
                         continue
                     
-                    self.samples.append((img, self.species_to_idx[species]))
+                    self.samples.append((img, None))  # Label will be assigned later
                     self.species_images.setdefault(species, []).append(img)
                     species_counts[species] = species_counts.get(species, 0) + 1
                     count += 1
                     
-                    if count % 100 == 0:
-                        log.info(f"   📊 Checkpoint: {count} images loaded from Hugging Face")
+                    if count % 500 == 0:
+                        log.info(f"   📊 Checkpoint: {count} images loaded, {len(species_counts)} species found")
                     
                 except Exception:
                     continue
                 
-                if count > 1000:
+                # Stop when we have enough total images
+                if count >= MAX_TOTAL_IMAGES:
+                    log.info(f"   📊 Reached max total images: {MAX_TOTAL_IMAGES}")
                     break
             
             self.species_stats.update(species_counts)
-            log.info(f"   ✅ Loaded {len(self.samples)} samples from Hugging Face")
-            return True
+            log.info(f"   ✅ Loaded {len(self.samples)} images of {len(species_counts)} species from Hugging Face")
             
         except Exception as e:
-            log.warning(f"   ⚠️ Failed to load Hugging Face dataset")
-            return False
+            log.warning(f"   ⚠️ Failed to load Hugging Face dataset: {e}")
     
     def _load_extra_pokemon(self, extra_dir: str):
+        """Load your extra Pokémon images."""
         extra_path = Path(extra_dir)
         if not extra_path.exists():
             return
@@ -532,10 +509,7 @@ class PokemonDataset(Dataset):
             if not species:
                 species = "unknown"
             
-            if species not in self.species_to_idx:
-                idx = len(self.species_to_idx)
-                self.species_to_idx[species] = idx
-            
+            # Load images
             images = []
             for ext in valid_extensions:
                 images.extend(folder.glob(f"*{ext}"))
@@ -543,9 +517,13 @@ class PokemonDataset(Dataset):
             if not images:
                 continue
             
-            current_count = species_counts.get(species, 0)
-            available = self.max_per_species - current_count
+            # Count existing images for this species
+            existing_count = len(self.species_images.get(species, []))
+            
+            # Only add up to max_per_species
+            available = self.max_per_species - existing_count
             if available <= 0:
+                log.info(f"   ⚠️ Already have {existing_count} images of {species}, skipping extras")
                 continue
             
             images = images[:available]
@@ -555,16 +533,47 @@ class PokemonDataset(Dataset):
                     img = Image.open(img_path).convert("RGB")
                     if img.size[0] < 10 or img.size[1] < 10:
                         continue
-                    self.samples.append((img, self.species_to_idx[species]))
+                    self.samples.append((img, None))  # Label assigned later
                     self.species_images.setdefault(species, []).append(img)
                     species_counts[species] = species_counts.get(species, 0) + 1
                 except Exception:
                     continue
         
+        # Update stats
         for species, count in species_counts.items():
             self.species_stats[species] = self.species_stats.get(species, 0) + count
         
-        log.info(f"   ✅ Loaded {len(self.samples)} samples from extra Pokémon")
+        log.info(f"   ✅ Added {sum(species_counts.values())} extra images from your folder")
+    
+    def _build_species_mapping(self):
+        """Build species to index mapping after all images are loaded."""
+        all_species = sorted(self.species_images.keys())
+        
+        if not all_species:
+            log.error("❌ No species found! No images loaded.")
+            return
+        
+        log.info(f"\n📊 Building species mapping for {len(all_species)} species...")
+        
+        self.species_to_idx = {s: i for i, s in enumerate(all_species)}
+        self.idx_to_species = {i: s for s, i in self.species_to_idx.items()}
+        
+        # Assign labels to samples
+        new_samples = []
+        for img, _ in self.samples:
+            # Find which species this image belongs to
+            # We stored images in species_images, so we need to match
+            # This is a bit hacky - we rebuild samples with labels
+            pass
+        
+        # Rebuild samples with proper labels
+        self.samples = []
+        for species, images in self.species_images.items():
+            idx = self.species_to_idx[species]
+            for img in images:
+                self.samples.append((img, idx))
+        
+        log.info(f"   ✅ Built mapping for {len(all_species)} species")
     
     def _print_stats(self):
         log.info("=" * 60)
@@ -579,13 +588,21 @@ class PokemonDataset(Dataset):
             log.info(f"   Min per species: {min(counts)}")
             log.info(f"   Max per species: {max(counts)}")
         
-        low_species = [s for s, c in self.species_stats.items() if c < 3]
-        if low_species:
-            log.warning(f"\n⚠️ {len(low_species)} species have < 3 images:")
-            for s in low_species[:5]:
-                log.warning(f"   - {s}: {self.species_stats[s]} images")
-            if len(low_species) > 5:
-                log.warning(f"   ... and {len(low_species) - 5} more")
+        # Show top species
+        top_species = sorted(self.species_stats.items(), key=lambda x: x[1], reverse=True)[:10]
+        log.info(f"\n   Top 10 species:")
+        for s, c in top_species:
+            log.info(f"      - {s}: {c} images")
+        
+        # Show your extra species
+        extra_path = Path("Extra pokemons")
+        if extra_path.exists():
+            extra_species = [f.name for f in extra_path.iterdir() if f.is_dir()]
+            if extra_species:
+                log.info(f"\n   📁 Your extra species: {len(extra_species)}")
+                for s in extra_species[:5]:
+                    count = self.species_stats.get(s.lower().replace("_", " ").strip(), 0)
+                    log.info(f"      - {s}: {count} images")
         
         if len(self.samples) < 10:
             log.error("❌ Too few samples! Need at least 10 images to train.")
@@ -606,13 +623,13 @@ class PokemonDataset(Dataset):
 
 def train():
     log.info("")
-    log.info("🚀 Pokémon AI Trainer")
+    log.info("🚀 Pokémon AI Trainer - FULL DATASET MODE")
     log.info("=" * 60)
     
     if HF_TOKEN:
         log.info(f"🔑 HF_TOKEN: ✅ Set")
     else:
-        log.warning(f"🔑 HF_TOKEN: ❌ Not set")
+        log.warning(f"🔑 HF_TOKEN: ❌ Not set - May have rate limits")
     
     log.info("\n📦 Checking for archive files...")
     extract_archive_files()
@@ -623,35 +640,11 @@ def train():
     log.info(f"   Existing species: {stats['total_species']}")
     log.info(f"   Existing features: {stats['total_features']}")
     
-    extra_path = Path("Extra pokemons")
-    extra_species = []
-    if extra_path.exists():
-        extra_species = [f.name.replace("_", " ").strip().lower() 
-                         for f in extra_path.iterdir() if f.is_dir()]
-        log.info(f"📁 Found {len(extra_species)} extra Pokémon species")
-        
-        for s in extra_species[:5]:
-            folder = extra_path / s.replace(" ", "_")
-            count = len(list(folder.glob("*"))) if folder.exists() else 0
-            log.info(f"      - {s}: {count} images")
-        if len(extra_species) > 5:
-            log.info(f"      ... and {len(extra_species) - 5} more")
-    
-    if not extra_species:
-        log.error("❌ No extra Pokémon found! Please upload images.")
-        return
-    
-    all_species = sorted(extra_species)
-    log.info(f"   Total species: {len(all_species)}")
-    
-    species_to_idx = {s: i for i, s in enumerate(all_species)}
-    idx_to_species = {i: s for s, i in species_to_idx.items()}
-    
-    log.info("\n📂 Creating dataset...")
+    # Create dataset with ALL Pokémon
+    log.info("\n📂 Creating dataset with ALL Pokémon...")
     dataset = PokemonDataset(
-        species_to_idx=species_to_idx,
-        max_per_species=MAX_IMAGES_PER_SPECIES,
-        extra_dir="Extra pokemons"
+        extra_dir="Extra pokemons",
+        max_per_species=MAX_IMAGES_PER_SPECIES
     )
     
     if len(dataset) == 0:
@@ -662,6 +655,7 @@ def train():
         log.error("❌ Too few samples! Need at least 10 images to train.")
         return
     
+    # Split dataset
     val_size = max(1, int(len(dataset) * 0.1))
     train_size = len(dataset) - val_size
     
@@ -673,12 +667,15 @@ def train():
     train_loader = DataLoader(train_dataset, batch_size=min(BATCH_SIZE, train_size), shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=min(BATCH_SIZE, val_size), shuffle=False, num_workers=0)
     
+    num_species = len(dataset.species_to_idx)
+    
     log.info(f"\n📊 Dataset split:")
+    log.info(f"   Total species: {num_species}")
     log.info(f"   Train samples: {train_size}")
     log.info(f"   Val samples: {val_size}")
     
     log.info("\n🧠 Initializing model...")
-    model = PokemonClassifier(num_species=len(all_species))
+    model = PokemonClassifier(num_species=num_species)
     model.to(DEVICE)
     model.feature_extractor.eval()
     
@@ -687,6 +684,7 @@ def train():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     
     log.info(f"\n🎯 Training for {EPOCHS} epochs...")
+    log.info(f"   Species: {num_species}")
     log.info(f"   Batch size: {min(BATCH_SIZE, train_size)}")
     log.info(f"   Learning rate: {LEARNING_RATE}")
     log.info("-" * 60)
@@ -798,11 +796,12 @@ def train():
     log.info(f"   Best validation accuracy: {best_val_acc:.1f}%")
     log.info(f"   Model saved to: {MODEL_OUTPUT}")
     
+    # Store features in database
     log.info("\n💾 Storing features in database...")
     
     species_images = {}
     for img, label_idx in dataset.samples:
-        species = idx_to_species[label_idx]
+        species = dataset.idx_to_species[label_idx]
         species_images.setdefault(species, []).append(img)
     
     log.info(f"   Extracting features for {len(species_images)} species...")
@@ -823,12 +822,11 @@ def train():
     info_path = os.path.join(os.path.dirname(MODEL_OUTPUT) or ".", "species_info.json")
     with open(info_path, 'w') as f:
         json.dump({
-            'species_list': all_species,
-            'num_species': len(all_species),
+            'species_list': list(dataset.species_to_idx.keys()),
+            'num_species': len(dataset.species_to_idx),
             'best_val_acc': best_val_acc,
             'max_per_species': MAX_IMAGES_PER_SPECIES,
-            'species_stats': dataset.species_stats,
-            'extra_pokemon': extra_species
+            'species_stats': dataset.species_stats
         }, f, indent=2)
     log.info(f"   Species info saved to: {info_path}")
     
