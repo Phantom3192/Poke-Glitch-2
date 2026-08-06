@@ -645,6 +645,55 @@ class StreamingPokemonDataset(IterableDataset):
 
 # ============ STREAMING TRAINER ============
 
+def store_features_to_db(model, dataset, db, label="checkpoint"):
+    """
+    Batched feature extraction + incremental DB write, using extract_batch
+    (not one-image-at-a-time) so it's fast even at thousands of images.
+    Called after every improved checkpoint, not just once at the very end,
+    so a crash mid-training doesn't lose everything collected so far.
+    """
+    log.info(f"\n💾 Storing features to database ({label})...")
+    t_start = time.time()
+    
+    image_buffer = []
+    label_buffer = []
+    feature_buffer: Dict[str, List[np.ndarray]] = {}
+    count = 0
+    
+    def flush_batch():
+        nonlocal count
+        if not image_buffer:
+            return
+        pil_imgs = [transforms.ToPILImage()(img.cpu()) for img in image_buffer]
+        features = model.feature_extractor.extract_batch(pil_imgs)
+        for feat, lbl in zip(features, label_buffer):
+            if not np.all(feat == 0):
+                species = dataset.idx_to_species[lbl]
+                feature_buffer.setdefault(species, []).append(feat)
+                count += 1
+        image_buffer.clear()
+        label_buffer.clear()
+    
+    for img, label in dataset:
+        image_buffer.append(img)
+        label_buffer.append(label)
+        if len(image_buffer) >= 50:
+            flush_batch()
+            for species, feats in feature_buffer.items():
+                if feats:
+                    db.add_pokemon_features(species, feats)
+            feature_buffer = {}
+            gc.collect()
+    
+    flush_batch()
+    for species, feats in feature_buffer.items():
+        if feats:
+            db.add_pokemon_features(species, feats)
+    
+    elapsed = time.time() - t_start
+    log.info(f"   ✅ Stored {count} features in {elapsed:.0f}s")
+
+
 def stream_train():    
     # ============ PRE-LOAD MODEL (NO DOWNLOAD DURING TRAINING) ============
 
@@ -921,6 +970,10 @@ def stream_train():
             os.makedirs(os.path.dirname(MODEL_OUTPUT) or ".", exist_ok=True)
             torch.save(model.feature_extractor.state_dict(), MODEL_OUTPUT)
             log.info(f"   ✅ Saved model (val acc: {val_acc:.1f}%)")
+            # Write features to DB right away too — don't wait until the
+            # whole run finishes. If Railway crashes on a later epoch,
+            # this checkpoint's data is already safe in the DB.
+            store_features_to_db(model, dataset, db, label=f"epoch {epoch+1}, val acc {val_acc:.1f}%")
         else:
             epochs_without_improvement += 1
         
@@ -941,36 +994,6 @@ def stream_train():
     log.info(f"✅ Training complete!")
     log.info(f"   Best validation accuracy: {best_val_acc:.1f}%")
     log.info(f"   Model saved to: {MODEL_OUTPUT}")
-    
-    # Store features in database
-    log.info("\n💾 Storing features in database...")
-    
-    # Stream through dataset one more time to extract features
-    feature_buffer = {}
-    count = 0
-    
-    for img, label in dataset:
-        species = dataset.idx_to_species[label]
-        feature = model.feature_extractor.extract(transforms.ToPILImage()(img.cpu()))
-        if not np.all(feature == 0):
-            feature_buffer.setdefault(species, []).append(feature)
-            count += 1
-        
-        # Store every 50 images to free memory
-        if count % 50 == 0:
-            for species, features in feature_buffer.items():
-                if features:
-                    db.add_pokemon_features(species, features)
-            feature_buffer = {}
-            gc.collect()
-            log.info(f"   📊 Stored {count} features so far")
-    
-    # Store remaining
-    for species, features in feature_buffer.items():
-        if features:
-            db.add_pokemon_features(species, features)
-    
-    log.info(f"   ✅ Stored {count} features in database")
     
     final_stats = db.get_stats()
     log.info(f"\n📊 Database Stats:")
