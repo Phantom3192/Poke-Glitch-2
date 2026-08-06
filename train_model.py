@@ -19,6 +19,52 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from io import BytesIO
 
+# ============ COMPLETE LOG SUPPRESSION ============
+# Must be done BEFORE importing any other modules
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["DATASETS_VERBOSITY"] = "error"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_VERBOSITY"] = "error"
+
+# Suppress ALL logging from other libraries
+import warnings
+warnings.filterwarnings("ignore")
+
+# Setup logging BEFORE any other imports that might create loggers
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+log = logging.getLogger("trainer")
+
+# Now suppress everything else
+logging.getLogger().setLevel(logging.WARNING)
+for logger_name in [
+    "urllib3",
+    "requests",
+    "datasets",
+    "huggingface_hub",
+    "filelock",
+    "transformers",
+    "torch",
+    "torchvision",
+    "PIL",
+    "matplotlib",
+    "tensorflow",
+    "absl",
+]:
+    logging.getLogger(logger_name).setLevel(logging.ERROR)
+    logging.getLogger(logger_name).disabled = True
+
+# Also suppress HTTP connection messages from urllib3
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except:
+    pass
+
+# Now import everything else
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,21 +75,6 @@ from torchvision import models
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
-
-# ============ SETUP LOGGING ============
-# Suppress verbose HTTP/urllib3 logs
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("requests").setLevel(logging.WARNING)
-logging.getLogger("datasets").setLevel(logging.WARNING)
-logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
-logging.getLogger("filelock").setLevel(logging.WARNING)
-
-# Only show INFO and above from our trainer
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-log = logging.getLogger("trainer")
 
 # ============ CONFIGURATION ============
 
@@ -62,9 +93,7 @@ AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "t
 # Set Hugging Face token
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
-    log.info(f"🔑 HF_TOKEN configured (length: {len(HF_TOKEN)})")
-else:
-    log.warning("⚠️ HF_TOKEN not set. Get token from: https://huggingface.co/settings/tokens")
+    log.info(f"🔑 HF_TOKEN configured")
 
 # Device
 DEVICE = torch.device("cpu")
@@ -110,7 +139,6 @@ def extract_archive_files():
                     with rarfile.RarFile(archive_path) as rf:
                         rf.extractall(temp_dir)
                 except:
-                    # Try unrar command
                     subprocess.run(['unrar', 'x', '-y', str(archive_path), str(temp_dir)], 
                                  capture_output=True, check=False)
             
@@ -125,7 +153,7 @@ def extract_archive_files():
                                  capture_output=True, check=False)
             
             # Process extracted files
-            extracted, species = process_extracted_files(temp_dir, extra_dir)
+            extracted = process_extracted_files(temp_dir, extra_dir)
             extracted_count += extracted
             
             shutil.rmtree(temp_dir)
@@ -143,10 +171,9 @@ def extract_archive_files():
             log.info(f"   📁 Extracted {len(species)} species, {extracted_count} images total")
 
 
-def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
+def process_extracted_files(temp_dir: Path, extra_dir: Path) -> int:
     """Process extracted files and organize them into species folders."""
     extracted_count = 0
-    species_found = set()
     
     valid_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.PNG', '.JPG', '.JPEG', '.WEBP'}
     
@@ -173,9 +200,8 @@ def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
                         counter += 1
                 shutil.move(str(src), str(dest))
                 extracted_count += 1
-                species_found.add(species_name)
     
-    return extracted_count, species_found
+    return extracted_count
 
 # ============ DATABASE LAYER ============
 
@@ -193,7 +219,7 @@ class Database:
                 self.use_turso = True
                 log.info(f"✅ Connected to Turso database")
             except Exception as e:
-                log.warning(f"Turso connection failed: {e}, using SQLite fallback")
+                log.warning(f"Turso connection failed, using SQLite fallback")
         
         if not self.use_turso:
             self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -358,14 +384,15 @@ class PokemonDataset(Dataset):
     
     def _load_huggingface(self):
         """Load images from Hugging Face dataset with progress checkpoints."""
-        log.info(f"📥 Loading Hugging Face dataset: {DATASET_NAME}")
+        log.info(f"📥 Loading Hugging Face dataset...")
         
         try:
             from datasets import load_dataset
             
-            # Suppress dataset logs
+            # Completely suppress dataset logs
             import warnings
             warnings.filterwarnings("ignore")
+            logging.getLogger("datasets").setLevel(logging.ERROR)
             
             ds = load_dataset(DATASET_NAME, split="train", streaming=True)
             
@@ -390,7 +417,6 @@ class PokemonDataset(Dataset):
             species_set = set(self.species_to_idx.keys())
             species_counts = {}
             count = 0
-            checkpoint = 0
             
             log.info(f"   🔄 Scanning dataset for matching species...")
             
@@ -419,10 +445,9 @@ class PokemonDataset(Dataset):
                     species_counts[species] = species_counts.get(species, 0) + 1
                     count += 1
                     
-                    # CHECKPOINT: Report every 50 images
-                    if count % 50 == 0:
-                        checkpoint += 50
-                        log.info(f"   📊 Checkpoint: {checkpoint} images loaded from Hugging Face")
+                    # CHECKPOINT: Report every 100 images
+                    if count % 100 == 0:
+                        log.info(f"   📊 Checkpoint: {count} images loaded from Hugging Face")
                     
                 except Exception:
                     continue
@@ -532,7 +557,7 @@ def train():
     
     # Show HF_TOKEN status
     if HF_TOKEN:
-        log.info(f"🔑 HF_TOKEN: ✅ Set (length: {len(HF_TOKEN)})")
+        log.info(f"🔑 HF_TOKEN: ✅ Set")
     else:
         log.warning(f"🔑 HF_TOKEN: ❌ Not set - Get from https://huggingface.co/settings/tokens")
     
