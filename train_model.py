@@ -1,6 +1,7 @@
 """
 train_model.py - Complete AI Pokémon Trainer for Railway
-Fetches from Hugging Face + your extra Pokémon (ZIP support)
+Supports: ZIP, RAR, and 7z archive extraction
+Fetches from Hugging Face + your extra Pokémon
 Trains model, stores in database
 """
 
@@ -41,7 +42,7 @@ LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-4"))
 DATASET_NAME = os.getenv("DATASET_NAME", "SpreadSheets/Poketwo-Spawn-Images")
 MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
-AUTO_EXTRACT_ZIP = os.getenv("AUTO_EXTRACT_ZIP", "true").lower() == "true"
+AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "true"
 
 # Device
 DEVICE = torch.device("cpu")
@@ -54,20 +55,36 @@ logging.basicConfig(
 )
 log = logging.getLogger("trainer")
 
-# ============ ZIP EXTRACTION ============
+# ============ ARCHIVE EXTRACTION ============
 
-def extract_zip_files():
-    """Extract any ZIP files in the current directory."""
-    if not AUTO_EXTRACT_ZIP:
+def extract_archive_files():
+    """
+    Extract ZIP, RAR, and 7z archive files.
+    Supports: .zip, .rar, .7z, .tar, .gz, .bz2
+    """
+    if not AUTO_EXTRACT_ARCHIVES:
         return
     
-    zip_files = list(Path(".").glob("*.zip"))
-    zip_files.extend(Path(".").glob("*.ZIP"))
+    # Supported archive formats
+    archive_patterns = [
+        "*.zip", "*.ZIP",
+        "*.rar", "*.RAR",
+        "*.7z", "*.7Z",
+        "*.tar", "*.TAR",
+        "*.gz", "*.GZ",
+        "*.bz2", "*.BZ2",
+        "*.tgz", "*.TGZ",
+    ]
     
-    if not zip_files:
+    archives = []
+    for pattern in archive_patterns:
+        archives.extend(Path(".").glob(pattern))
+    
+    if not archives:
+        log.info("📦 No archive files found.")
         return
     
-    log.info(f"📦 Found {len(zip_files)} ZIP file(s), extracting...")
+    log.info(f"📦 Found {len(archives)} archive file(s), extracting...")
     
     extra_dir = Path("Extra pokemons")
     extra_dir.mkdir(exist_ok=True)
@@ -75,86 +92,87 @@ def extract_zip_files():
     extracted_count = 0
     species_found = set()
     
-    for zip_path in zip_files:
+    for archive_path in archives:
         try:
-            temp_dir = Path(f"temp_extract_{zip_path.stem}")
+            ext = archive_path.suffix.lower()
+            
+            # Create temp directory for extraction
+            temp_dir = Path(f"temp_extract_{archive_path.stem}")
             temp_dir.mkdir(exist_ok=True)
             
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
+            # Extract based on file type
+            if ext in ['.zip']:
+                log.info(f"   📂 Extracting ZIP: {archive_path.name}")
+                with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
             
-            # Find all image files and organize by folder structure
-            # First, look for species folders
-            species_folders = []
+            elif ext in ['.rar']:
+                log.info(f"   📂 Extracting RAR: {archive_path.name}")
+                try:
+                    import rarfile
+                    with rarfile.RarFile(archive_path) as rf:
+                        rf.extractall(temp_dir)
+                except ImportError:
+                    log.warning("   ⚠️ rarfile not installed. Install with: pip install rarfile")
+                    # Try using unrar command (if available)
+                    import subprocess
+                    try:
+                        subprocess.run(['unrar', 'x', str(archive_path), str(temp_dir)], 
+                                     capture_output=True, check=True)
+                    except:
+                        log.error(f"   ❌ Cannot extract RAR. Please install: pip install rarfile")
+                        continue
             
-            # Check if zip has folder structure
-            for item in temp_dir.iterdir():
-                if item.is_dir():
-                    # Check if this folder contains species folders or images directly
-                    sub_items = list(item.iterdir())
-                    if sub_items:
-                        # Check if sub_items are directories (species folders)
-                        has_species = any(s.is_dir() for s in sub_items)
-                        if has_species:
-                            # It's a folder with species subfolders
-                            for species_folder in sub_items:
-                                if species_folder.is_dir():
-                                    species_folders.append(species_folder)
-                        else:
-                            # It's a folder with images directly (single species)
-                            # Use the folder name as species name
-                            species_folders.append(item)
-                elif item.is_file() and item.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
-                    # Image directly in root - put in unknown
-                    unknown_dir = extra_dir / "unknown"
-                    unknown_dir.mkdir(exist_ok=True)
-                    shutil.move(str(item), str(unknown_dir / item.name))
-                    extracted_count += 1
-                    species_found.add("unknown")
+            elif ext in ['.7z']:
+                log.info(f"   📂 Extracting 7z: {archive_path.name}")
+                try:
+                    import py7zr
+                    with py7zr.SevenZipFile(archive_path, 'r') as sz:
+                        sz.extractall(temp_dir)
+                except ImportError:
+                    log.warning("   ⚠️ py7zr not installed. Install with: pip install py7zr")
+                    # Try using 7z command
+                    import subprocess
+                    try:
+                        subprocess.run(['7z', 'x', str(archive_path), f'-o{temp_dir}'], 
+                                     capture_output=True, check=True)
+                    except:
+                        log.error(f"   ❌ Cannot extract 7z. Please install: pip install py7zr")
+                        continue
             
-            # Process species folders
-            for folder in species_folders:
-                species_name = folder.name.replace("_", " ").strip()
-                if not species_name:
-                    species_name = "unknown"
-                
-                dest_dir = extra_dir / folder.name
-                dest_dir.mkdir(exist_ok=True)
-                
-                # Move all images
-                images = []
-                for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp', '*.PNG', '*.JPG', '*.JPEG', '*.WEBP']:
-                    images.extend(folder.glob(ext))
-                
-                for img in images:
-                    dest_path = dest_dir / img.name
-                    # Handle duplicate filenames
-                    if dest_path.exists():
-                        counter = 1
-                        while dest_path.exists():
-                            stem = img.stem
-                            suffix = img.suffix
-                            dest_path = dest_dir / f"{stem}_{counter}{suffix}"
-                            counter += 1
-                    shutil.move(str(img), str(dest_path))
-                    extracted_count += 1
-                    species_found.add(species_name)
+            elif ext in ['.tar', '.gz', '.tgz', '.bz2']:
+                log.info(f"   📂 Extracting TAR: {archive_path.name}")
+                import tarfile
+                with tarfile.open(archive_path, 'r:*') as tar:
+                    tar.extractall(temp_dir)
             
-            # Clean up
+            else:
+                log.warning(f"   ⚠️ Unsupported archive format: {ext}")
+                shutil.rmtree(temp_dir)
+                continue
+            
+            # Process extracted files
+            extracted, species = process_extracted_files(temp_dir, extra_dir)
+            extracted_count += extracted
+            species_found.update(species)
+            
+            # Clean up temp directory
             shutil.rmtree(temp_dir)
             
-            # Remove the zip file after extraction
-            zip_path.unlink()
-            log.info(f"   ✅ Extracted: {zip_path.name}")
+            # Remove the archive file after extraction
+            archive_path.unlink()
+            log.info(f"   ✅ Extracted: {archive_path.name} ({extracted} images)")
             
         except Exception as e:
-            log.error(f"   ❌ Failed to extract {zip_path}: {e}")
+            log.error(f"   ❌ Failed to extract {archive_path}: {e}")
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
     
     # Show what was extracted
     if extra_dir.exists():
         species = [f for f in extra_dir.iterdir() if f.is_dir()]
         if species:
-            log.info(f"   📁 Extracted {len(species)} species from ZIP files:")
+            log.info(f"\n   📁 Extracted {len(species)} species from archives:")
             for s in species[:5]:
                 count = len(list(s.glob("*")))
                 log.info(f"      - {s.name}: {count} images")
@@ -163,6 +181,92 @@ def extract_zip_files():
         
         total_images = sum(len(list(f.glob("*"))) for f in species)
         log.info(f"   📊 Total images extracted: {total_images}")
+
+
+def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
+    """
+    Process extracted files and organize them into species folders.
+    Returns (image_count, species_set).
+    """
+    extracted_count = 0
+    species_found = set()
+    
+    valid_extensions = {'.png', '.jpg', '.jpeg', '.webp', 
+                        '.PNG', '.JPG', '.JPEG', '.WEBP'}
+    
+    # Walk through extracted files
+    for root, dirs, files in os.walk(temp_dir):
+        root_path = Path(root)
+        
+        # Check if this directory contains images
+        images = [f for f in files if Path(f).suffix in valid_extensions]
+        
+        if images:
+            # Determine species name from folder structure
+            rel_path = root_path.relative_to(temp_dir)
+            
+            if len(rel_path.parts) == 0:
+                # Files in root - use "unknown"
+                species_name = "unknown"
+            else:
+                # Use the first folder name as species
+                species_name = rel_path.parts[0].replace("_", " ").strip()
+                if not species_name:
+                    species_name = "unknown"
+            
+            # Create destination folder
+            dest_dir = extra_dir / species_name.replace(" ", "_")
+            dest_dir.mkdir(exist_ok=True)
+            
+            # Move images
+            for img_name in images:
+                src = root_path / img_name
+                dest = dest_dir / img_name
+                
+                # Handle duplicates
+                if dest.exists():
+                    counter = 1
+                    stem = Path(img_name).stem
+                    suffix = Path(img_name).suffix
+                    while dest.exists():
+                        dest = dest_dir / f"{stem}_{counter}{suffix}"
+                        counter += 1
+                
+                shutil.move(str(src), str(dest))
+                extracted_count += 1
+                species_found.add(species_name)
+        
+        # Also check subdirectories for species folders
+        for d in dirs:
+            sub_path = root_path / d
+            sub_images = [f for f in sub_path.iterdir() if f.suffix in valid_extensions]
+            
+            if sub_images:
+                species_name = d.replace("_", " ").strip()
+                if not species_name:
+                    species_name = "unknown"
+                
+                dest_dir = extra_dir / species_name.replace(" ", "_")
+                dest_dir.mkdir(exist_ok=True)
+                
+                for img in sub_images:
+                    dest = dest_dir / img.name
+                    if dest.exists():
+                        counter = 1
+                        stem = img.stem
+                        suffix = img.suffix
+                        while dest.exists():
+                            dest = dest_dir / f"{stem}_{counter}{suffix}"
+                            counter += 1
+                    shutil.move(str(img), str(dest))
+                    extracted_count += 1
+                    species_found.add(species_name)
+                
+                # Remove empty directory
+                if not list(sub_path.iterdir()):
+                    sub_path.rmdir()
+    
+    return extracted_count, species_found
 
 # ============ DATABASE LAYER ============
 
@@ -606,9 +710,9 @@ def train():
     log.info("🚀 Pokémon AI Trainer")
     log.info("=" * 60)
     
-    # Extract any ZIP files
-    log.info("📦 Checking for ZIP files...")
-    extract_zip_files()
+    # Extract any archive files
+    log.info("📦 Checking for archive files (ZIP, RAR, 7z, TAR)...")
+    extract_archive_files()
     
     # Initialize database
     log.info("\n📂 Connecting to database...")
