@@ -559,7 +559,17 @@ class StreamingPokemonDataset(IterableDataset):
 
 # ============ STREAMING TRAINER ============
 
-def stream_train():
+def stream_train():    
+    # ============ PRE-LOAD MODEL (NO DOWNLOAD DURING TRAINING) ============
+
+    log.info("📥 Pre-loading AI model...")
+    try:
+        from torchvision import models
+        _ = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        log.info("✅ Model loaded and cached!")
+    except Exception as e:
+        log.warning(f"⚠️ Model pre-load failed: {e}")
+    
     """Train using streaming - process in batches, clear memory."""
     
     log.info("")
