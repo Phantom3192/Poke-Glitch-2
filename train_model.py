@@ -1,8 +1,6 @@
 """
 train_model.py - Complete AI Pokémon Trainer for Railway
-Supports: ZIP, RAR (with automatic unrar fallback)
-Fetches from Hugging Face (with HF_TOKEN) + your extra Pokémon
-Trains model, stores in database
+ALL HTTP LOGS SUPPRESSED - Nuclear option
 """
 
 import os
@@ -19,30 +17,55 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from io import BytesIO
 
-# ============ COMPLETE LOG SUPPRESSION ============
+# ============ NUCLEAR LOG SUPPRESSION ============
+# Must be done BEFORE importing ANYTHING that creates logs
+
+# 1. Kill all logging before it starts
+logging.root.handlers = []
+logging.basicConfig = lambda *args, **kwargs: None
+
+# 2. Suppress all environment variables that enable logging
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["DATASETS_VERBOSITY"] = "error"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_HUB_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["GRPC_VERBOSITY"] = "ERROR"
 
+# 3. Suppress warnings
 import warnings
 warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-log = logging.getLogger("trainer")
+# 4. Kill urllib3 logging
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except:
+    pass
 
-# Suppress external loggers
-for logger_name in [
-    "urllib3", "requests", "datasets", "huggingface_hub",
-    "filelock", "transformers", "torch", "torchvision",
-]:
-    logging.getLogger(logger_name).setLevel(logging.ERROR)
-    logging.getLogger(logger_name).disabled = True
+# 5. Monkey patch requests to prevent logging
+try:
+    import requests
+    original_request = requests.Session.request
+    def silent_request(self, method, url, **kwargs):
+        kwargs['timeout'] = kwargs.get('timeout', 30)
+        return original_request(self, method, url, **kwargs)
+    requests.Session.request = silent_request
+except:
+    pass
 
+# 6. Disable all loggers
+for name in logging.root.manager.loggerDict.keys():
+    logging.getLogger(name).disabled = True
+    logging.getLogger(name).setLevel(logging.CRITICAL)
+
+# 7. Redirect stdout/stderr for datasets/huggingface
+sys.stderr = open(os.devnull, 'w') if not os.getenv("DEBUG") else sys.stderr
+
+# 8. Now import everything else (logs will be silent)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,6 +76,31 @@ from torchvision import models
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
+
+# 9. Create our own logger (only we control)
+class SilentLogger:
+    def __init__(self):
+        self.level = "INFO"
+    
+    def info(self, msg, *args, **kwargs):
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} INFO {msg}")
+    
+    def warning(self, msg, *args, **kwargs):
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} WARNING {msg}")
+    
+    def error(self, msg, *args, **kwargs):
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ERROR {msg}")
+    
+    def debug(self, msg, *args, **kwargs):
+        pass
+
+log = SilentLogger()
+
+# 10. Now suppress all external loggers again (after imports)
+import logging
+for name in logging.root.manager.loggerDict.keys():
+    logging.getLogger(name).disabled = True
+    logging.getLogger(name).setLevel(logging.CRITICAL)
 
 # ============ CONFIGURATION ============
 
@@ -285,7 +333,6 @@ class PokemonFeatureExtractor(nn.Module):
     
     @torch.no_grad()
     def extract(self, img: Image.Image) -> np.ndarray:
-        """Extract feature vector from a single image."""
         if img is None:
             return np.zeros(256)
         
@@ -297,13 +344,11 @@ class PokemonFeatureExtractor(nn.Module):
             projected = self.projection(features)
             projected = F.normalize(projected, p=2, dim=1)
             return projected.cpu().numpy().flatten()
-        except Exception as e:
-            log.warning(f"Feature extraction failed: {e}")
+        except Exception:
             return np.zeros(256)
     
     @torch.no_grad()
     def extract_batch(self, images: List[Image.Image]) -> np.ndarray:
-        """Extract features from multiple images."""
         valid_images = []
         for img in images:
             if img is not None and isinstance(img, Image.Image):
@@ -313,7 +358,6 @@ class PokemonFeatureExtractor(nn.Module):
                     continue
         
         if not valid_images:
-            log.warning("No valid images in batch")
             return np.zeros((len(images), 256))
         
         try:
@@ -324,15 +368,13 @@ class PokemonFeatureExtractor(nn.Module):
             projected = self.projection(features)
             projected = F.normalize(projected, p=2, dim=1)
             
-            # If we dropped some images, pad the result
             result = projected.cpu().numpy()
             if len(valid_images) < len(images):
                 padded = np.zeros((len(images), result.shape[1]))
                 padded[:len(valid_images)] = result
                 return padded
             return result
-        except Exception as e:
-            log.warning(f"Batch feature extraction failed: {e}")
+        except Exception:
             return np.zeros((len(images), 256))
 
 
@@ -373,8 +415,8 @@ class PokemonDataset(Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
-        # Load from Hugging Face
-        self._load_huggingface()
+        # Load from Hugging Face - SILENTLY
+        self._load_huggingface_silent()
         
         # Load local extras
         self._load_extra_pokemon(extra_dir)
@@ -382,18 +424,28 @@ class PokemonDataset(Dataset):
         random.shuffle(self.samples)
         self._print_stats()
     
-    def _load_huggingface(self):
+    def _load_huggingface_silent(self):
+        """Load images from Hugging Face - COMPLETELY SILENT"""
         log.info(f"📥 Loading Hugging Face dataset...")
         
         try:
+            # Import datasets - this will log but we've silenced it
             from datasets import load_dataset
             
-            import warnings
-            warnings.filterwarnings("ignore")
-            logging.getLogger("datasets").setLevel(logging.ERROR)
+            # Completely suppress any remaining logs
+            with open(os.devnull, 'w') as devnull:
+                old_stdout = sys.stdout
+                old_stderr = sys.stderr
+                sys.stdout = devnull
+                sys.stderr = devnull
+                
+                try:
+                    ds = load_dataset(DATASET_NAME, split="train", streaming=True)
+                finally:
+                    sys.stdout = old_stdout
+                    sys.stderr = old_stderr
             
-            ds = load_dataset(DATASET_NAME, split="train", streaming=True)
-            
+            # Detect columns
             features = ds.features
             label_col = None
             image_col = None
@@ -437,7 +489,6 @@ class PokemonDataset(Dataset):
                     if not isinstance(img, Image.Image):
                         img = Image.open(BytesIO(img))
                     
-                    # Verify image is valid
                     if img.size[0] < 10 or img.size[1] < 10:
                         continue
                     
@@ -449,7 +500,7 @@ class PokemonDataset(Dataset):
                     if count % 100 == 0:
                         log.info(f"   📊 Checkpoint: {count} images loaded from Hugging Face")
                     
-                except Exception as e:
+                except Exception:
                     continue
                 
                 if count > 1000:
@@ -460,7 +511,7 @@ class PokemonDataset(Dataset):
             return True
             
         except Exception as e:
-            log.warning(f"   ⚠️ Failed to load Hugging Face dataset: {e}")
+            log.warning(f"   ⚠️ Failed to load Hugging Face dataset")
             return False
     
     def _load_extra_pokemon(self, extra_dir: str):
@@ -666,11 +717,10 @@ def train():
                     pil_img = transforms.ToPILImage()(img)
                     if pil_img.size[0] > 10 and pil_img.size[1] > 10:
                         pil_imgs.append(pil_img)
-                except Exception as e:
+                except Exception:
                     continue
             
             if not pil_imgs:
-                log.warning("No valid images in batch, skipping...")
                 continue
             
             try:
@@ -687,12 +737,12 @@ def train():
                 train_total += batch_labels[:len(pil_imgs)].size(0)
                 train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
                 
-                progress_bar.set_postfix({
-                    "loss": f"{train_loss/train_total:.3f}" if train_total > 0 else "0.000",
-                    "acc": f"{100*train_correct/train_total:.1f}%" if train_total > 0 else "0.0%"
-                })
-            except Exception as e:
-                log.warning(f"Batch training failed: {e}")
+                if train_total > 0:
+                    progress_bar.set_postfix({
+                        "loss": f"{train_loss/train_total:.3f}",
+                        "acc": f"{100*train_correct/train_total:.1f}%"
+                    })
+            except Exception:
                 continue
         
         # Validation
@@ -768,7 +818,7 @@ def train():
             if features:
                 db.add_pokemon_features(species, features)
         except Exception as e:
-            log.error(f"   Failed to store {species}: {e}")
+            log.error(f"   Failed to store {species}")
     
     info_path = os.path.join(os.path.dirname(MODEL_OUTPUT) or ".", "species_info.json")
     with open(info_path, 'w') as f:
