@@ -386,6 +386,11 @@ class StreamingPokemonDataset(IterableDataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
+        # Cache of (tensor, label) collected on the first pass, reused for
+        # every later epoch so we never re-hit Hugging Face after epoch 1.
+        self._cache: List[Tuple[torch.Tensor, int]] = []
+        self._cache_ready = False
+        
         # Build species mapping FIRST
         self._build_species_mapping()
         
@@ -464,7 +469,31 @@ class StreamingPokemonDataset(IterableDataset):
             log.info(f"   Limited to {len(selected)} species (MAX_SPECIES={MAX_SPECIES})")
     
     def __iter__(self) -> Iterator:
-        """Stream images one by one from Hugging Face."""
+        """
+        Epoch 1: streams local images + Hugging Face images, caching every
+        yielded (tensor, label) pair. Stops hitting HF as soon as every
+        species has MAX_IMAGES_PER_SPECIES images (instead of scanning the
+        whole remaining dataset for nothing).
+        Epoch 2+: replays from the in-memory cache, no network at all.
+        """
+        
+        if self._cache_ready:
+            log.info(f"   ♻️  Replaying {len(self._cache)} cached images (no HF re-stream)")
+            for item in self._cache:
+                yield item
+            return
+        
+        target_total = len(self.species_to_idx) * MAX_IMAGES_PER_SPECIES
+        species_counts: Dict[str, int] = {}
+        collected = 0
+        t_start = time.time()
+        
+        def _emit(tensor, label, species):
+            nonlocal collected
+            species_counts[species] = species_counts.get(species, 0) + 1
+            collected += 1
+            self._cache.append((tensor, label))
+            return tensor, label
         
         # First, yield local images
         extra_path = Path(self.extra_dir)
@@ -481,15 +510,24 @@ class StreamingPokemonDataset(IterableDataset):
                 valid_extensions = {".png", ".jpg", ".jpeg", ".webp"}
                 
                 for img_path in folder.iterdir():
+                    if species_counts.get(species, 0) >= MAX_IMAGES_PER_SPECIES:
+                        break
                     if img_path.suffix.lower() not in valid_extensions:
                         continue
                     
                     try:
                         img = Image.open(img_path).convert("RGB")
                         if img.size[0] > 10 and img.size[1] > 10:
-                            yield self.transform(img), label
+                            yield _emit(self.transform(img), label, species)
                     except Exception:
                         continue
+        
+        log.info(f"   📂 Local images collected: {collected}/{target_total}")
+        
+        if collected >= target_total:
+            self._cache_ready = True
+            log.info(f"   ✅ Quota already met from local images, skipping HF stream")
+            return
         
         # Then, stream from Hugging Face
         try:
@@ -515,9 +553,18 @@ class StreamingPokemonDataset(IterableDataset):
                 label_col = list(features.keys())[0]
                 image_col = list(features.keys())[1] if len(features) > 1 else list(features.keys())[0]
             
-            species_counts = {}
+            rows_scanned = 0
             
             for row in ds:
+                rows_scanned += 1
+                
+                # Heartbeat so it never looks frozen, even mid-scan
+                if rows_scanned % 200 == 0:
+                    elapsed = time.time() - t_start
+                    log.info(f"   🔎 Scanned {rows_scanned} HF rows, "
+                             f"kept {collected}/{target_total} images "
+                             f"({elapsed:.0f}s elapsed)")
+                
                 try:
                     raw_label = row[label_col]
                     if isinstance(raw_label, int):
@@ -542,16 +589,27 @@ class StreamingPokemonDataset(IterableDataset):
                         continue
                     
                     label = self.species_to_idx[species]
-                    species_counts[species] = species_counts.get(species, 0) + 1
                     
-                    yield self.transform(img), label
+                    yield _emit(self.transform(img), label, species)
+                    
+                    # Stop as soon as every species has its quota instead
+                    # of scanning the rest of the dataset for nothing.
+                    if collected >= target_total:
+                        log.info(f"   ✅ Quota met ({collected}/{target_total}) "
+                                 f"after scanning {rows_scanned} HF rows")
+                        break
                     
                 except Exception:
                     continue
                 
         except Exception as e:
             log.warning(f"Error streaming from Hugging Face: {e}")
-            return
+        
+        if collected < target_total:
+            log.warning(f"   ⚠️ Only found {collected}/{target_total} images "
+                        f"before HF dataset was exhausted")
+        
+        self._cache_ready = True
     
     def get_num_species(self) -> int:
         return len(self.species_to_idx)
@@ -690,10 +748,9 @@ def stream_train():
                     train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
                     batch_count += 1
                     
-                    # Progress update
-                    if batch_count % 10 == 0:
-                        acc = 100 * train_correct / train_total if train_total > 0 else 0
-                        log.info(f"   📊 Batch {batch_count}: Loss: {train_loss/train_total:.3f}, Acc: {acc:.1f}%")
+                    # Progress update (every batch — cheap now that images are cached)
+                    acc = 100 * train_correct / train_total if train_total > 0 else 0
+                    log.info(f"   📊 Batch {batch_count}: Loss: {train_loss/train_total:.3f}, Acc: {acc:.1f}%")
                     
                 except Exception as e:
                     log.warning(f"   ⚠️ Batch failed: {e}")
