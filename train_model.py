@@ -283,9 +283,11 @@ class Database:
 class PokemonFeatureExtractor(nn.Module):
     def __init__(self, embedding_dim: int = 256):
         super().__init__()
-        self.backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        # MobileNetV3-Large: ~same param count as the old EfficientNet-B0
+        # (5.4M vs 5.3M) but 2-3x faster on CPU.
+        self.backbone = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
         self.backbone.classifier = nn.Identity()
-        backbone_dim = 1280
+        backbone_dim = 960  # lastconv_output_channels for mobilenet_v3_large
         
         self.projection = nn.Sequential(
             nn.Linear(backbone_dim, embedding_dim),
@@ -310,12 +312,18 @@ class PokemonFeatureExtractor(nn.Module):
         try:
             img_tensor = self.transform(img).unsqueeze(0).to(DEVICE)
             img_tensor = self.normalize(img_tensor)
+            # backbone already returns a flat (N, backbone_dim) vector —
+            # its forward() does avgpool+flatten internally before the
+            # (now-identity) classifier. Do NOT re-pool here; the old
+            # code's adaptive_avg_pool2d on an already-2D tensor was
+            # silently throwing and falling back to an all-zero vector
+            # on every single image.
             features = self.backbone(img_tensor)
-            features = F.adaptive_avg_pool2d(features, (1, 1)).flatten(1)
             projected = self.projection(features)
             projected = F.normalize(projected, p=2, dim=1)
             return projected.cpu().numpy().flatten()
-        except Exception:
+        except Exception as e:
+            log.warning(f"   ⚠️ Feature extraction failed: {e}")
             return np.zeros(256)
     
     @torch.no_grad()
@@ -334,8 +342,7 @@ class PokemonFeatureExtractor(nn.Module):
         try:
             batch_tensor = torch.cat(valid_images, dim=0).to(DEVICE)
             batch_tensor = self.normalize(batch_tensor)
-            features = self.backbone(batch_tensor)
-            features = F.adaptive_avg_pool2d(features, (1, 1)).flatten(1)
+            features = self.backbone(batch_tensor)  # already flat (N, backbone_dim)
             projected = self.projection(features)
             projected = F.normalize(projected, p=2, dim=1)
             
@@ -345,7 +352,8 @@ class PokemonFeatureExtractor(nn.Module):
                 padded[:len(valid_images)] = result
                 return padded
             return result
-        except Exception:
+        except Exception as e:
+            log.warning(f"   ⚠️ Batch feature extraction failed: {e}")
             return np.zeros((len(images), 256))
 
 
@@ -623,7 +631,7 @@ def stream_train():
     log.info("📥 Pre-loading AI model...")
     try:
         from torchvision import models
-        _ = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        _ = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
         log.info("✅ Model loaded and cached!")
     except Exception as e:
         log.warning(f"⚠️ Model pre-load failed: {e}")
