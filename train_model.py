@@ -1,6 +1,6 @@
 """
 train_model.py - Complete AI Pokémon Trainer for Railway
-Supports: ZIP, RAR, and 7z archive extraction
+Supports: ZIP, RAR (with automatic unrar fallback)
 Fetches from Hugging Face + your extra Pokémon
 Trains model, stores in database
 """
@@ -14,6 +14,7 @@ import random
 import time
 import zipfile
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from io import BytesIO
@@ -28,7 +29,6 @@ from torchvision import models
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
-from datasets import load_dataset
 
 # ============ CONFIGURATION ============
 
@@ -59,25 +59,25 @@ log = logging.getLogger("trainer")
 
 def extract_archive_files():
     """
-    Extract ZIP, RAR, and 7z archive files.
-    Supports: .zip, .rar, .7z, .tar, .gz, .bz2
+    Extract ZIP and RAR archive files.
+    Tries multiple methods for RAR extraction.
     """
     if not AUTO_EXTRACT_ARCHIVES:
         return
     
-    # Supported archive formats
-    archive_patterns = [
-        "*.zip", "*.ZIP",
-        "*.rar", "*.RAR",
-        "*.7z", "*.7Z",
-        "*.tar", "*.TAR",
-        "*.gz", "*.GZ",
-        "*.bz2", "*.BZ2",
-        "*.tgz", "*.TGZ",
-    ]
-    
+    # Find archives
     archives = []
-    for pattern in archive_patterns:
+    
+    # ZIP files
+    for pattern in ["*.zip", "*.ZIP"]:
+        archives.extend(Path(".").glob(pattern))
+    
+    # RAR files
+    for pattern in ["*.rar", "*.RAR"]:
+        archives.extend(Path(".").glob(pattern))
+    
+    # 7z files
+    for pattern in ["*.7z", "*.7Z"]:
         archives.extend(Path(".").glob(pattern))
     
     if not archives:
@@ -95,12 +95,9 @@ def extract_archive_files():
     for archive_path in archives:
         try:
             ext = archive_path.suffix.lower()
-            
-            # Create temp directory for extraction
             temp_dir = Path(f"temp_extract_{archive_path.stem}")
             temp_dir.mkdir(exist_ok=True)
             
-            # Extract based on file type
             if ext in ['.zip']:
                 log.info(f"   📂 Extracting ZIP: {archive_path.name}")
                 with zipfile.ZipFile(archive_path, 'r') as zip_ref:
@@ -108,43 +105,19 @@ def extract_archive_files():
             
             elif ext in ['.rar']:
                 log.info(f"   📂 Extracting RAR: {archive_path.name}")
-                try:
-                    import rarfile
-                    with rarfile.RarFile(archive_path) as rf:
-                        rf.extractall(temp_dir)
-                except ImportError:
-                    log.warning("   ⚠️ rarfile not installed. Install with: pip install rarfile")
-                    # Try using unrar command (if available)
-                    import subprocess
-                    try:
-                        subprocess.run(['unrar', 'x', str(archive_path), str(temp_dir)], 
-                                     capture_output=True, check=True)
-                    except:
-                        log.error(f"   ❌ Cannot extract RAR. Please install: pip install rarfile")
-                        continue
+                extracted = extract_rar_with_fallback(archive_path, temp_dir)
+                if not extracted:
+                    log.error(f"   ❌ Failed to extract RAR: {archive_path.name}")
+                    shutil.rmtree(temp_dir)
+                    continue
             
             elif ext in ['.7z']:
                 log.info(f"   📂 Extracting 7z: {archive_path.name}")
-                try:
-                    import py7zr
-                    with py7zr.SevenZipFile(archive_path, 'r') as sz:
-                        sz.extractall(temp_dir)
-                except ImportError:
-                    log.warning("   ⚠️ py7zr not installed. Install with: pip install py7zr")
-                    # Try using 7z command
-                    import subprocess
-                    try:
-                        subprocess.run(['7z', 'x', str(archive_path), f'-o{temp_dir}'], 
-                                     capture_output=True, check=True)
-                    except:
-                        log.error(f"   ❌ Cannot extract 7z. Please install: pip install py7zr")
-                        continue
-            
-            elif ext in ['.tar', '.gz', '.tgz', '.bz2']:
-                log.info(f"   📂 Extracting TAR: {archive_path.name}")
-                import tarfile
-                with tarfile.open(archive_path, 'r:*') as tar:
-                    tar.extractall(temp_dir)
+                extracted = extract_7z_with_fallback(archive_path, temp_dir)
+                if not extracted:
+                    log.error(f"   ❌ Failed to extract 7z: {archive_path.name}")
+                    shutil.rmtree(temp_dir)
+                    continue
             
             else:
                 log.warning(f"   ⚠️ Unsupported archive format: {ext}")
@@ -183,6 +156,83 @@ def extract_archive_files():
         log.info(f"   📊 Total images extracted: {total_images}")
 
 
+def extract_rar_with_fallback(rar_path: Path, dest_dir: Path) -> bool:
+    """Extract RAR using multiple methods."""
+    
+    # Method 1: Try rarfile library
+    try:
+        import rarfile
+        with rarfile.RarFile(rar_path) as rf:
+            rf.extractall(dest_dir)
+        return True
+    except ImportError:
+        log.debug("   rarfile not installed, trying unrar command...")
+    except Exception as e:
+        log.debug(f"   rarfile failed: {e}, trying unrar command...")
+    
+    # Method 2: Try unrar command
+    try:
+        result = subprocess.run(
+            ['unrar', 'x', '-y', str(rar_path), str(dest_dir)],
+            capture_output=True,
+            timeout=60
+        )
+        if result.returncode == 0:
+            return True
+        else:
+            log.debug(f"   unrar failed: {result.stderr}")
+    except FileNotFoundError:
+        log.debug("   unrar command not found")
+    except Exception as e:
+        log.debug(f"   unrar command failed: {e}")
+    
+    # Method 3: Try 7z command (sometimes available)
+    try:
+        result = subprocess.run(
+            ['7z', 'x', '-y', str(rar_path), f'-o{dest_dir}'],
+            capture_output=True,
+            timeout=60
+        )
+        if result.returncode == 0:
+            return True
+    except:
+        pass
+    
+    log.error(f"   ❌ Cannot extract RAR. Please convert to ZIP format.")
+    log.error(f"   Run: zip -r Extra pokemons.zip Extra pokemons/")
+    return False
+
+
+def extract_7z_with_fallback(archive_path: Path, dest_dir: Path) -> bool:
+    """Extract 7z using multiple methods."""
+    
+    # Method 1: Try py7zr
+    try:
+        import py7zr
+        with py7zr.SevenZipFile(archive_path, 'r') as sz:
+            sz.extractall(dest_dir)
+        return True
+    except ImportError:
+        log.debug("   py7zr not installed, trying 7z command...")
+    except Exception as e:
+        log.debug(f"   py7zr failed: {e}, trying 7z command...")
+    
+    # Method 2: Try 7z command
+    try:
+        result = subprocess.run(
+            ['7z', 'x', '-y', str(archive_path), f'-o{dest_dir}'],
+            capture_output=True,
+            timeout=60
+        )
+        if result.returncode == 0:
+            return True
+    except:
+        pass
+    
+    log.error(f"   ❌ Cannot extract 7z.")
+    return False
+
+
 def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
     """
     Process extracted files and organize them into species folders.
@@ -206,10 +256,8 @@ def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
             rel_path = root_path.relative_to(temp_dir)
             
             if len(rel_path.parts) == 0:
-                # Files in root - use "unknown"
                 species_name = "unknown"
             else:
-                # Use the first folder name as species
                 species_name = rel_path.parts[0].replace("_", " ").strip()
                 if not species_name:
                     species_name = "unknown"
@@ -223,7 +271,6 @@ def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
                 src = root_path / img_name
                 dest = dest_dir / img_name
                 
-                # Handle duplicates
                 if dest.exists():
                     counter = 1
                     stem = Path(img_name).stem
@@ -236,7 +283,7 @@ def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
                 extracted_count += 1
                 species_found.add(species_name)
         
-        # Also check subdirectories for species folders
+        # Also check subdirectories
         for d in dirs:
             sub_path = root_path / d
             sub_images = [f for f in sub_path.iterdir() if f.suffix in valid_extensions]
@@ -261,10 +308,6 @@ def process_extracted_files(temp_dir: Path, extra_dir: Path) -> Tuple[int, set]:
                     shutil.move(str(img), str(dest))
                     extracted_count += 1
                     species_found.add(species_name)
-                
-                # Remove empty directory
-                if not list(sub_path.iterdir()):
-                    sub_path.rmdir()
     
     return extracted_count, species_found
 
@@ -280,7 +323,6 @@ class Database:
         # Try Turso first
         if TURSO_URL:
             try:
-                # Try importing libsql
                 import libsql_experimental as libsql
                 self._conn = libsql.connect(TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
                 self.use_turso = True
@@ -508,7 +550,7 @@ class PokemonDataset(Dataset):
         self.max_per_species = max_per_species
         self.samples = []
         self.species_stats = {}
-        self.species_images = {}  # Store images for feature extraction
+        self.species_images = {}
         
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -519,10 +561,10 @@ class PokemonDataset(Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
-        # Load from Hugging Face
-        self._load_huggingface()
+        # Try loading from Hugging Face first
+        hf_loaded = self._load_huggingface()
         
-        # Load extra Pokémon
+        # Always load local extras
         self._load_extra_pokemon(extra_dir)
         
         random.shuffle(self.samples)
@@ -530,9 +572,10 @@ class PokemonDataset(Dataset):
     
     def _load_huggingface(self):
         """Load images from Hugging Face dataset."""
-        log.info(f"📥 Loading Hugging Face dataset: {DATASET_NAME}")
+        log.info(f"📥 Attempting to load Hugging Face dataset: {DATASET_NAME}")
         
         try:
+            from datasets import load_dataset
             ds = load_dataset(DATASET_NAME, split="train", streaming=True)
             
             # Detect columns
@@ -557,9 +600,9 @@ class PokemonDataset(Dataset):
             log.info(f"   Label column: {label_col}, Image column: {image_col}")
             
             species_counts = {}
+            count = 0
             for row in ds:
                 try:
-                    # Get label
                     raw_label = row[label_col]
                     if isinstance(raw_label, int):
                         raw_label = features[label_col].int2str(raw_label)
@@ -571,7 +614,6 @@ class PokemonDataset(Dataset):
                     if species_counts.get(species, 0) >= self.max_per_species:
                         continue
                     
-                    # Get image
                     img = row[image_col]
                     if img is None:
                         continue
@@ -582,15 +624,22 @@ class PokemonDataset(Dataset):
                     self.samples.append((img, self.species_to_idx[species]))
                     self.species_images.setdefault(species, []).append(img)
                     species_counts[species] = species_counts.get(species, 0) + 1
+                    count += 1
                     
                 except Exception as e:
                     continue
+                
+                if count > 1000:  # Limit for speed
+                    break
             
             self.species_stats.update(species_counts)
             log.info(f"   ✅ Loaded {len(self.samples)} samples from Hugging Face")
+            return True
             
         except Exception as e:
-            log.error(f"   ❌ Failed to load Hugging Face dataset: {e}")
+            log.warning(f"   ⚠️ Failed to load Hugging Face dataset: {e}")
+            log.warning(f"   Will use only local extra Pokémon images")
+            return False
     
     def _load_extra_pokemon(self, extra_dir: str):
         """Load extra Pokémon from local folder."""
@@ -626,7 +675,7 @@ class PokemonDataset(Dataset):
                 log.warning(f"   ⚠️ No images found in {folder}")
                 continue
             
-            # Limit per species (don't exceed max)
+            # Limit per species
             current_count = species_counts.get(species, 0)
             available = self.max_per_species - current_count
             if available <= 0:
@@ -721,41 +770,13 @@ def train():
     log.info(f"   Existing species: {stats['total_species']}")
     log.info(f"   Existing features: {stats['total_features']}")
     
-    # Get species from Hugging Face
-    log.info("\n🔍 Discovering species...")
-    hf_species = set()
-    try:
-        ds = load_dataset(DATASET_NAME, split="train", streaming=True)
-        features = ds.features
-        
-        label_col = None
-        for col in ["label", "text", "name", "species", "pokemon"]:
-            if col in features:
-                label_col = col
-                break
-        
-        if label_col:
-            count = 0
-            for row in ds:
-                raw_label = row[label_col]
-                if isinstance(raw_label, int):
-                    raw_label = features[label_col].int2str(raw_label)
-                species = str(raw_label).strip().lower()
-                hf_species.add(species)
-                count += 1
-                if count > 5000:  # Enough to get most species
-                    break
-        log.info(f"   Found {len(hf_species)} species in Hugging Face")
-    except Exception as e:
-        log.warning(f"   Could not get species list: {e}")
-    
     # Check for extra Pokémon
     extra_path = Path("Extra pokemons")
     extra_species = []
     if extra_path.exists():
         extra_species = [f.name.replace("_", " ").strip().lower() 
                          for f in extra_path.iterdir() if f.is_dir()]
-        log.info(f"   Found {len(extra_species)} extra Pokémon species")
+        log.info(f"📁 Found {len(extra_species)} extra Pokémon species")
         
         # Show what was found
         for s in extra_species[:5]:
@@ -765,13 +786,15 @@ def train():
         if len(extra_species) > 5:
             log.info(f"      ... and {len(extra_species) - 5} more")
     
-    # Combine species
-    all_species = sorted(hf_species | set(extra_species))
-    log.info(f"   Total species: {len(all_species)}")
-    
-    if not all_species:
-        log.error("❌ No species found! Exiting.")
+    # If no species found, exit
+    if not extra_species:
+        log.error("❌ No extra Pokémon found! Please upload images.")
+        log.error("   Expected: Extra pokemons/pikachu/1.png")
         return
+    
+    # Use only extra species (skip Hugging Face if it failed)
+    all_species = sorted(extra_species)
+    log.info(f"   Total species: {len(all_species)}")
     
     # Create mapping
     species_to_idx = {s: i for i, s in enumerate(all_species)}
