@@ -14,6 +14,7 @@ import zipfile
 import shutil
 import subprocess
 import gc
+import resource
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Iterator
 from io import BytesIO
@@ -71,13 +72,26 @@ class SilentLogger:
 
 log = SilentLogger()
 
+def log_memory(tag: str = ""):
+    """
+    Logs current process RSS (resident memory) using stdlib `resource`
+    - no extra dependency. Lets you actually watch memory climb in the
+    Railway logs batch-by-batch instead of only finding out when the
+    container gets killed. ru_maxrss is KB on Linux.
+    """
+    try:
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        log.info(f"   🧠 Memory{f' ({tag})' if tag else ''}: {rss_mb:.0f} MB peak RSS")
+    except Exception:
+        pass
+
 # ============ CONFIGURATION ============
 
 TURSO_URL = os.getenv("TURSO_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))  # Increased for streaming
-STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "25"))  # Images per stream batch - kept small so only one small chunk is ever in memory at a time
+STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "20"))  # Images per stream batch - kept small so only one small chunk is ever in memory at a time
 EPOCHS = int(os.getenv("EPOCHS", "20"))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-4"))
 EARLY_STOP_ACC = float(os.getenv("EARLY_STOP_ACC", "95.0"))  # stop once train acc hits this %
@@ -258,24 +272,44 @@ class Database:
     
     def add_pokemon_features(self, species: str, features: List[np.ndarray], 
                              variant_names: List[str] = None):
-        if variant_names is None:
-            variant_names = [f"{species}_{i+1}" for i in range(len(features))]
-        
+        self.add_pokemon_features_batch({species: features})
+
+    def add_pokemon_features_batch(self, species_to_features: Dict[str, List[np.ndarray]]):
+        """
+        Writes features for MULTIPLE species in ONE cursor + ONE commit,
+        instead of one cursor/commit per species. This matters a lot once
+        we're saving after every small training chunk (a chunk of ~25
+        images can easily span 15-25 different species) - doing a separate
+        commit per species per chunk multiplies DB round-trips a lot, and
+        with the experimental Turso client in particular that repeated
+        cursor/commit churn is a plausible source of memory growth over
+        many batches. Batching it into one commit per chunk avoids that.
+        """
+        if not species_to_features:
+            return
         cursor = self._conn.cursor()
-        for i, feature in enumerate(features):
-            feature_json = json.dumps(feature.tolist())
-            variant_name = variant_names[i] if i < len(variant_names) else f"{species}_{i+1}"
-            cursor.execute("""
-                INSERT OR REPLACE INTO pokemon_features 
-                (species, variant_name, feature_vector, created_at)
-                VALUES (?, ?, ?, strftime('%s', 'now'))
-            """, (species, variant_name, feature_json))
-        
-        cursor.execute("""
-            INSERT OR REPLACE INTO species_info (species, count, last_updated)
-            VALUES (?, ?, strftime('%s', 'now'))
-        """, (species, len(features)))
-        self._conn.commit()
+        try:
+            for species, features in species_to_features.items():
+                if not features:
+                    continue
+                variant_names = [f"{species}_{i+1}" for i in range(len(features))]
+                for i, feature in enumerate(features):
+                    feature_json = json.dumps(feature.tolist())
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO pokemon_features 
+                        (species, variant_name, feature_vector, created_at)
+                        VALUES (?, ?, ?, strftime('%s', 'now'))
+                    """, (species, variant_names[i], feature_json))
+                cursor.execute("""
+                    INSERT OR REPLACE INTO species_info (species, count, last_updated)
+                    VALUES (?, ?, strftime('%s', 'now'))
+                """, (species, len(features)))
+            self._conn.commit()
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
     
     def get_stats(self) -> Dict[str, Any]:
         cursor = self._conn.cursor()
@@ -295,13 +329,17 @@ class Database:
 class PokemonFeatureExtractor(nn.Module):
     def __init__(self, embedding_dim: int = 256):
         super().__init__()
-        # MobileNetV3-Small: much lighter/faster than Large on CPU
-        # (2.5M vs 5.4M params). Given how few images/species you're
-        # training on, Large's extra accuracy headroom isn't buying much
-        # anyway — speed matters more here.
-        self.backbone = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
-        self.backbone.classifier = nn.Identity()
-        backbone_dim = 576  # lastconv_output_channels for mobilenet_v3_small
+        # ShuffleNetV2 x0.5: fastest of the reasonable CPU-friendly options
+        # (1.4M params vs MobileNetV3-Small's 2.5M) - swapped in specifically
+        # for epoch speed now that the disk cache means epochs 2+ are
+        # compute-bound rather than network-bound. Trade-off: its features
+        # are somewhat weaker than MobileNetV3-Small's, which matters more
+        # than usual here given how little data there is per species (25
+        # images x 1119 classes) - worth watching train/val accuracy after
+        # this swap to confirm it's not costing more than the speed is worth.
+        self.backbone = models.shufflenet_v2_x0_5(weights=models.ShuffleNet_V2_X0_5_Weights.DEFAULT)
+        self.backbone.fc = nn.Identity()
+        backbone_dim = 1024  # ShuffleNetV2 x0.5's pre-fc feature dim
         
         self.projection = nn.Sequential(
             nn.Linear(backbone_dim, embedding_dim),
@@ -340,6 +378,7 @@ class PokemonFeatureExtractor(nn.Module):
             log.warning(f"   ⚠️ Feature extraction failed: {e}")
             return np.zeros(256)
     
+    @torch.no_grad()
     @torch.no_grad()
     def extract_batch(self, images: List[Image.Image]) -> np.ndarray:
         valid_images = []
@@ -419,6 +458,27 @@ class StreamingPokemonDataset(IterableDataset):
         # every later epoch so we never re-hit Hugging Face after epoch 1.
         self._cache: List[Tuple[torch.Tensor, int]] = []
         self._cache_ready = False
+        
+        # Disk-backed chunk cache: epoch 1 writes (tensor,label) pairs to
+        # small files on disk as it streams from HF, instead of only
+        # keeping them in RAM. Epoch 2+ then reads those chunk files
+        # straight off disk - no network calls, no RAM buildup (one small
+        # chunk loaded at a time), and it even survives a container
+        # restart. This is independent of MAX_CACHE_IMAGES (the RAM cap)
+        # and is the main lever for avoiding a slow multi-hour re-scan of
+        # Hugging Face on every epoch.
+        self.disk_cache_enabled = os.getenv("DISK_CACHE", "true").lower() == "true"
+        self.disk_cache_dir = Path(os.getenv("DISK_CACHE_DIR", "image_cache"))
+        self._disk_chunk_files: List[Path] = []
+        if self.disk_cache_enabled:
+            self.disk_cache_dir.mkdir(parents=True, exist_ok=True)
+            # Resume from a previous run's disk cache if one is already there
+            existing = sorted(self.disk_cache_dir.glob("chunk_*.pt"))
+            if existing:
+                self._disk_chunk_files = existing
+                self._cache_ready = True
+                log.info(f"   💽 Found {len(existing)} cached chunk files on disk "
+                         f"from a previous run - will replay from disk, no HF re-stream")
         
         # Build species mapping FIRST
         self._build_species_mapping()
@@ -522,6 +582,20 @@ class StreamingPokemonDataset(IterableDataset):
         Epoch 2+: replays from the in-memory cache, no network at all.
         """
         
+        if self._disk_chunk_files:
+            log.info(f"   💽 Replaying {len(self._disk_chunk_files)} chunk files from disk "
+                     f"(no HF re-stream, no network)")
+            for chunk_path in self._disk_chunk_files:
+                try:
+                    chunk = torch.load(chunk_path, weights_only=False)
+                    for item in chunk:
+                        yield item
+                    del chunk
+                except Exception as e:
+                    log.warning(f"   ⚠️ Failed to load cache chunk {chunk_path}: {e}")
+            gc.collect()
+            return
+        
         if self._cache_ready:
             log.info(f"   ♻️  Replaying {len(self._cache)} cached images (no HF re-stream)")
             for item in self._cache:
@@ -533,6 +607,27 @@ class StreamingPokemonDataset(IterableDataset):
         collected = 0
         cache_capped_warned = False
         t_start = time.time()
+        
+        # Buffer for the disk-backed cache - flushed to a new chunk file
+        # every DISK_CHUNK_SIZE images so we're never holding more than
+        # one chunk's worth in RAM for this purpose.
+        DISK_CHUNK_SIZE = 200
+        disk_buffer: List[Tuple[torch.Tensor, int]] = []
+        chunk_idx = 0
+        
+        def _flush_disk_chunk():
+            nonlocal disk_buffer, chunk_idx
+            if not self.disk_cache_enabled or not disk_buffer:
+                return
+            chunk_path = self.disk_cache_dir / f"chunk_{chunk_idx:05d}.pt"
+            try:
+                torch.save(disk_buffer, chunk_path)
+                self._disk_chunk_files.append(chunk_path)
+                chunk_idx += 1
+            except Exception as e:
+                log.warning(f"   ⚠️ Failed to write cache chunk to disk: {e}")
+            disk_buffer = []
+            gc.collect()
         
         def _emit(tensor, label, species):
             nonlocal collected, cache_capped_warned
@@ -549,6 +644,10 @@ class StreamingPokemonDataset(IterableDataset):
                             f"later epochs will replay only the cached subset, "
                             f"not the full {target_total}-image target. Raise "
                             f"MAX_CACHE_IMAGES if you have RAM to spare.")
+            if self.disk_cache_enabled:
+                disk_buffer.append((tensor, label))
+                if len(disk_buffer) >= DISK_CHUNK_SIZE:
+                    _flush_disk_chunk()
             return tensor, label
         
         # First, yield local images
@@ -581,6 +680,7 @@ class StreamingPokemonDataset(IterableDataset):
         log.info(f"   📂 Local images collected: {collected}/{target_total}")
         
         if collected >= target_total:
+            _flush_disk_chunk()
             self._cache_ready = True
             log.info(f"   ✅ Quota already met from local images, skipping HF stream")
             return
@@ -665,6 +765,7 @@ class StreamingPokemonDataset(IterableDataset):
             log.warning(f"   ⚠️ Only found {collected}/{target_total} images "
                         f"before HF dataset was exhausted")
         
+        _flush_disk_chunk()
         self._cache_ready = True
     
     def get_num_species(self) -> int:
@@ -689,9 +790,8 @@ def store_chunk_features_to_db(features_tensor, batch_labels, idx_to_species: Di
             species = idx_to_species.get(lbl)
             if species:
                 feature_buffer.setdefault(species, []).append(feat)
-    for species, feats in feature_buffer.items():
-        if feats:
-            db.add_pokemon_features(species, feats)
+    # One cursor, one commit for the whole chunk - see add_pokemon_features_batch.
+    db.add_pokemon_features_batch(feature_buffer)
 
 
 def store_features_to_db(model, dataset, db, label="checkpoint"):
@@ -728,16 +828,12 @@ def store_features_to_db(model, dataset, db, label="checkpoint"):
         label_buffer.append(label)
         if len(image_buffer) >= 50:
             flush_batch()
-            for species, feats in feature_buffer.items():
-                if feats:
-                    db.add_pokemon_features(species, feats)
+            db.add_pokemon_features_batch(feature_buffer)
             feature_buffer = {}
             gc.collect()
     
     flush_batch()
-    for species, feats in feature_buffer.items():
-        if feats:
-            db.add_pokemon_features(species, feats)
+    db.add_pokemon_features_batch(feature_buffer)
     
     elapsed = time.time() - t_start
     log.info(f"   ✅ Stored {count} features in {elapsed:.0f}s")
@@ -749,10 +845,12 @@ def stream_train():
     log.info("📥 Pre-loading AI model...")
     try:
         from torchvision import models
-        _ = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
+        _ = models.shufflenet_v2_x0_5(weights=models.ShuffleNet_V2_X0_5_Weights.DEFAULT)
         log.info("✅ Model loaded and cached!")
     except Exception as e:
         log.warning(f"⚠️ Model pre-load failed: {e}")
+    
+    log_memory("baseline, right after model load")
     
     """Train using streaming - process in batches, clear memory."""
     
@@ -908,6 +1006,7 @@ def stream_train():
                 del features, logits
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 gc.collect()
+                log_memory(f"batch {batch_count}")
                 
                 # Reset buffer
                 image_buffer = []
@@ -961,6 +1060,7 @@ def stream_train():
                 del batch_labels
                 del pil_imgs
                 gc.collect()
+                log_memory("leftover chunk")
         
         train_acc = 100 * train_correct / train_total if train_total > 0 else 0
         
