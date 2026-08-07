@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import gc
 import resource
+import threading
+import queue
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Iterator
 from io import BytesIO
@@ -84,6 +86,61 @@ def log_memory(tag: str = ""):
         log.info(f"   🧠 Memory{f' ({tag})' if tag else ''}: {rss_mb:.0f} MB peak RSS")
     except Exception:
         pass
+
+
+class PrefetchIterator:
+    """
+    Wraps a slow iterator (e.g. one that hits the network) in a background
+    thread with a small bounded queue, so the NEXT item can be fetched
+    while the caller is busy doing something else (e.g. training on the
+    current chunk) - overlapping network wait time with CPU compute time
+    instead of paying both costs back-to-back.
+
+    Deliberately conservative about not crashing the main process:
+    - queue is bounded (maxsize) so a fast producer can't outrun the
+      consumer and blow up memory
+    - the background thread is a daemon, so it can never block shutdown
+    - any exception in the producer is caught, stored, and re-raised in
+      the MAIN thread on next() - it never crashes silently or hangs
+    - if thread startup itself fails for any reason, falls back to
+      plain synchronous iteration (no prefetching, but still works)
+    """
+    _SENTINEL = object()
+
+    def __init__(self, source_iterable, maxsize: int = 4):
+        self._source = source_iterable
+        self._queue: "queue.Queue" = queue.Queue(maxsize=maxsize)
+        self._error: Optional[BaseException] = None
+        self._thread: Optional[threading.Thread] = None
+        try:
+            self._thread = threading.Thread(target=self._produce, daemon=True)
+            self._thread.start()
+        except Exception as e:
+            log.warning(f"   ⚠️ Prefetch thread failed to start ({e}), "
+                        f"falling back to non-prefetched loading")
+            self._thread = None
+
+    def _produce(self):
+        try:
+            for item in self._source:
+                self._queue.put(item)
+        except BaseException as e:
+            self._error = e
+        finally:
+            self._queue.put(self._SENTINEL)
+
+    def __iter__(self):
+        if self._thread is None:
+            # Fallback: no thread running, just iterate the source directly.
+            yield from self._source
+            return
+        while True:
+            item = self._queue.get()
+            if item is self._SENTINEL:
+                if self._error is not None:
+                    raise self._error
+                return
+            yield item
 
 # ============ CONFIGURATION ============
 
@@ -923,7 +980,7 @@ def stream_train():
         image_buffer = []
         label_buffer = []
         
-        for img, label in dataset:
+        for img, label in PrefetchIterator(dataset, maxsize=STREAM_BATCH_SIZE * 2):
             image_buffer.append(img)
             label_buffer.append(label)
             
