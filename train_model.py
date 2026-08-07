@@ -17,6 +17,8 @@ import gc
 import resource
 import threading
 import queue
+import base64
+import io
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Iterator
 from io import BytesIO
@@ -155,16 +157,14 @@ EARLY_STOP_ACC = float(os.getenv("EARLY_STOP_ACC", "95.0"))  # stop once train a
 EARLY_STOP_PATIENCE = int(os.getenv("EARLY_STOP_PATIENCE", "3"))  # stop if val acc doesn't improve for N epochs
 DATASET_NAME = os.getenv("DATASET_NAME", "SpreadSheets/Poketwo-Spawn-Images")
 MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
-# Full training state (model + optimizer + scheduler + epoch/best-acc
-# bookkeeping), written at the end of every epoch. This is what lets a
-# restart resume training instead of starting over with fresh random
-# weights - MODEL_OUTPUT above only ever held feature_extractor weights
-# and was write-only (nothing ever loaded it back in).
-CHECKPOINT_PATH = os.getenv("CHECKPOINT_PATH", "models/checkpoint.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
 AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "true"
 MAX_SPECIES = int(os.getenv("MAX_SPECIES", "100"))  # Max species to train
 MAX_IMAGES_PER_SPECIES = int(os.getenv("MAX_IMAGES_PER_SPECIES", "10"))
+# Of each species' MAX_IMAGES_PER_SPECIES quota, this many are held out into
+# a real validation set that NEVER gets trained on - see the note on the old
+# validation code in stream_train() for why this matters.
+VAL_IMAGES_PER_SPECIES = int(os.getenv("VAL_IMAGES_PER_SPECIES", "2"))
 # Hard cap on how many images get cached in RAM for reuse across epochs.
 # Each cached image is a 224x224x3 uint8 tensor (~150KB). Default 8000
 # images caps the cache at ~1.2GB, which should be safe on most small
@@ -261,7 +261,17 @@ def process_extracted_files(temp_dir: Path, extra_dir: Path) -> int:
         
         if images:
             rel_path = root_path.relative_to(temp_dir)
-            species_name = rel_path.parts[0].replace("_", " ").strip() if rel_path.parts else "unknown"
+            # BUG FIXED: was `rel_path.parts[0]`, which grabs the FIRST path
+            # component under temp_dir. If the zip has a wrapper folder
+            # around the real per-species folders (e.g. "Extra pokemons/DJ
+            # Rotom/img.jpg"), parts[0] is "Extra pokemons" - the wrapper,
+            # not the species - so every species collapses into one fake
+            # "species" (this is exactly why the log showed "Extracted 1
+            # species, 153 images total" instead of dozens). parts[-1] is
+            # the immediate parent folder of the images - the actual
+            # species folder - regardless of how many wrapper folders sit
+            # above it.
+            species_name = rel_path.parts[-1].replace("_", " ").strip() if rel_path.parts else "unknown"
             
             dest_dir = extra_dir / species_name.replace(" ", "_")
             dest_dir.mkdir(exist_ok=True)
@@ -393,7 +403,47 @@ class Database:
         cursor.execute("SELECT COUNT(*) FROM species_info")
         total_species = cursor.fetchone()[0]
         return {"total_features": total_features, "total_species": total_species, "use_turso": self.use_turso}
-    
+
+    def save_checkpoint_blob(self, data: bytes):
+        """
+        Stores the full training checkpoint (model + optimizer + scheduler
+        state) as base64 text in the training_metadata table, which already
+        exists for exactly this kind of key/value bookkeeping. Railway's
+        local container disk gets wiped on restart (confirmed by the
+        "No checkpoint found" + missing image-cache-chunk log lines - the
+        whole local filesystem is ephemeral there), but the Turso DB is
+        remote and clearly does survive restarts (Existing species/features
+        carry over every time). So the DB - not local disk - is the only
+        thing checkpointing can actually rely on here.
+        """
+        cursor = self._conn.cursor()
+        try:
+            b64 = base64.b64encode(data).decode("ascii")
+            cursor.execute("""
+                INSERT OR REPLACE INTO training_metadata (key, value, updated_at)
+                VALUES ('checkpoint', ?, strftime('%s', 'now'))
+            """, (b64,))
+            self._conn.commit()
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+    def load_checkpoint_blob(self) -> Optional[bytes]:
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute("SELECT value FROM training_metadata WHERE key = 'checkpoint'")
+            row = cursor.fetchone()
+            if row and row[0]:
+                return base64.b64decode(row[0])
+            return None
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
     def close(self):
         if self._conn:
             self._conn.close()
@@ -577,16 +627,47 @@ class StreamingPokemonDataset(IterableDataset):
         self.disk_cache_enabled = os.getenv("DISK_CACHE", "true").lower() == "true"
         self.disk_cache_dir = Path(os.getenv("DISK_CACHE_DIR", "image_cache"))
         self._disk_chunk_files: List[Path] = []
+        self._resume_partial_chunks: List[Path] = []
+        self._complete_marker = self.disk_cache_dir / "_complete.marker"
         if self.disk_cache_enabled:
             self.disk_cache_dir.mkdir(parents=True, exist_ok=True)
-            # Resume from a previous run's disk cache if one is already there
             existing = sorted(self.disk_cache_dir.glob("chunk_*.pt"))
-            if existing:
+            if existing and self._complete_marker.exists():
+                # A previous run finished its full streaming pass (hit quota
+                # or exhausted HF) and said so explicitly - safe to treat
+                # this as the whole dataset and never touch HF again.
                 self._disk_chunk_files = existing
                 self._cache_ready = True
                 log.info(f"   💽 Found {len(existing)} cached chunk files on disk "
-                         f"from a previous run - will replay from disk, no HF re-stream")
+                         f"from a previous COMPLETED run - will replay from disk, no HF re-stream")
+            elif existing:
+                # BUG FIXED: chunk files with no completion marker means the
+                # previous run was cut off mid-stream (OOM, restart, redeploy)
+                # before finishing. The old code couldn't tell this apart from
+                # a genuinely finished run and would lock onto this partial
+                # slice as "the dataset" forever, silently starving training
+                # of the rest of the data on every future run. Now: replay
+                # what's already saved (so it isn't wasted) and keep
+                # streaming from HF afterward to fill out the remaining quota.
+                self._resume_partial_chunks = existing
+                log.info(f"   💽 Found {len(existing)} PARTIAL cached chunk files "
+                         f"(no completion marker - a previous run was cut off) - "
+                         f"will replay those, then resume streaming from Hugging "
+                         f"Face to fill the rest")
         
+        # Held-out validation images - collected once during the first
+        # streaming pass (first VAL_IMAGES_PER_SPECIES images of each
+        # species), never yielded for training, persisted to its own file
+        # so it survives restarts just like the train chunks do.
+        self._val_cache: List[Tuple[torch.Tensor, int]] = []
+        self.val_cache_path = self.disk_cache_dir / "val_cache.pt"
+        if self.disk_cache_enabled and self.val_cache_path.exists():
+            try:
+                self._val_cache = torch.load(self.val_cache_path, weights_only=False)
+                log.info(f"   💽 Loaded {len(self._val_cache)} held-out validation images from disk")
+            except Exception as e:
+                log.warning(f"   ⚠️ Failed to load validation cache: {e}")
+
         # Build species mapping FIRST
         self._build_species_mapping()
         
@@ -721,7 +802,32 @@ class StreamingPokemonDataset(IterableDataset):
         DISK_CHUNK_SIZE = 200
         disk_buffer: List[Tuple[torch.Tensor, int]] = []
         chunk_idx = 0
-        
+
+        # Resume from a PARTIAL disk cache left by a run that got cut off:
+        # replay it first (so that progress isn't wasted and we don't
+        # re-download images we already have) and update species_counts/
+        # collected so the HF stream below only fetches what's still
+        # missing, instead of starting the whole quota over from zero.
+        if self._resume_partial_chunks:
+            chunk_idx = len(self._resume_partial_chunks)
+            replayed = 0
+            for chunk_path in self._resume_partial_chunks:
+                try:
+                    chunk = torch.load(chunk_path, weights_only=False)
+                    for tensor, label in chunk:
+                        species = self.idx_to_species.get(label)
+                        if species:
+                            species_counts[species] = species_counts.get(species, 0) + 1
+                            collected += 1
+                            replayed += 1
+                        yield tensor, label
+                    del chunk
+                except Exception as e:
+                    log.warning(f"   ⚠️ Failed to replay partial chunk {chunk_path}: {e}")
+            gc.collect()
+            log.info(f"   💽 Replayed {replayed} images from partial cache "
+                     f"({collected}/{target_total}) - resuming HF stream for the rest")
+
         def _flush_disk_chunk():
             nonlocal disk_buffer, chunk_idx
             if not self.disk_cache_enabled or not disk_buffer:
@@ -731,6 +837,11 @@ class StreamingPokemonDataset(IterableDataset):
                 torch.save(disk_buffer, chunk_path)
                 self._disk_chunk_files.append(chunk_path)
                 chunk_idx += 1
+                # Re-save the (small) held-out val set alongside each train
+                # chunk flush too, so a crash mid-stream doesn't lose
+                # whatever validation images were collected so far.
+                if self._val_cache:
+                    torch.save(self._val_cache, self.val_cache_path)
             except Exception as e:
                 log.warning(f"   ⚠️ Failed to write cache chunk to disk: {e}")
             disk_buffer = []
@@ -738,8 +849,19 @@ class StreamingPokemonDataset(IterableDataset):
         
         def _emit(tensor, label, species):
             nonlocal collected, cache_capped_warned
-            species_counts[species] = species_counts.get(species, 0) + 1
+            # Position of this image within its species' quota, BEFORE
+            # incrementing - used to decide train vs. held-out validation.
+            species_idx = species_counts.get(species, 0)
+            species_counts[species] = species_idx + 1
             collected += 1
+
+            if species_idx < VAL_IMAGES_PER_SPECIES:
+                # Held out - never trained on, never disk-chunked into the
+                # training cache. Returning None tells the caller not to
+                # yield this one into the training stream.
+                self._val_cache.append((tensor, label))
+                return None
+
             # Cap cache growth so a large run can't OOM the container.
             # Images beyond the cap still get trained on this epoch (via
             # the yield below), they just aren't retained for epoch 2+.
@@ -794,7 +916,9 @@ class StreamingPokemonDataset(IterableDataset):
                     try:
                         img = Image.open(img_path).convert("RGB")
                         if img.size[0] > 10 and img.size[1] > 10:
-                            yield _emit(self.transform(img), label, species)
+                            item = _emit(self.transform(img), label, species)
+                            if item is not None:
+                                yield item
                     except Exception:
                         continue
         
@@ -803,10 +927,12 @@ class StreamingPokemonDataset(IterableDataset):
         if collected >= target_total:
             _flush_disk_chunk()
             self._cache_ready = True
+            self._write_completion_marker(collected, target_total)
             log.info(f"   ✅ Quota already met from local images, skipping HF stream")
             return
         
         # Then, stream from Hugging Face
+        stream_error = False
         try:
             from datasets import load_dataset
             
@@ -867,7 +993,9 @@ class StreamingPokemonDataset(IterableDataset):
                     
                     label = self.species_to_idx[species]
                     
-                    yield _emit(self.transform(img), label, species)
+                    item = _emit(self.transform(img), label, species)
+                    if item is not None:
+                        yield item
                     
                     # Stop as soon as every species has its quota instead
                     # of scanning the rest of the dataset for nothing.
@@ -881,6 +1009,7 @@ class StreamingPokemonDataset(IterableDataset):
                 
         except Exception as e:
             log.warning(f"Error streaming from Hugging Face: {e}")
+            stream_error = True
         
         if collected < target_total:
             log.warning(f"   ⚠️ Only found {collected}/{target_total} images "
@@ -888,7 +1017,32 @@ class StreamingPokemonDataset(IterableDataset):
         
         _flush_disk_chunk()
         self._cache_ready = True
+        # Only mark the disk cache "complete" (skip HF forever on future
+        # runs) if we actually finished the pass - quota met, or the HF
+        # iterator ran out cleanly. If it stopped because of a raised
+        # exception (network drop etc.) leave it unmarked so a restart
+        # resumes the partial-chunk path above and keeps trying to fill
+        # the quota, instead of silently freezing on whatever was collected
+        # right before the error.
+        if not stream_error:
+            self._write_completion_marker(collected, target_total)
     
+    def _write_completion_marker(self, collected: int, target_total: int):
+        if not self.disk_cache_enabled:
+            return
+        try:
+            self._complete_marker.write_text(json.dumps({
+                "collected": collected,
+                "target_total": target_total,
+                "species": len(self.species_to_idx),
+                "completed_at": time.time(),
+            }))
+        except Exception as e:
+            log.warning(f"   ⚠️ Failed to write cache-completion marker: {e}")
+
+    def get_val_set(self) -> List[Tuple[torch.Tensor, int]]:
+        return self._val_cache
+
     def get_num_species(self) -> int:
         return len(self.species_to_idx)
 
@@ -1042,10 +1196,15 @@ def stream_train():
     start_epoch = 0
 
     # ============ RESUME FROM CHECKPOINT IF ONE EXISTS ============
-    if os.path.exists(CHECKPOINT_PATH):
+    # Stored in the DB (Turso), not local disk - see Database.save_checkpoint_blob
+    # for why: Railway's local container disk doesn't survive restarts here,
+    # but the DB provably does (Existing species/features carry over every
+    # time).
+    checkpoint_blob = db.load_checkpoint_blob()
+    if checkpoint_blob:
         try:
-            log.info(f"\n💾 Found checkpoint at {CHECKPOINT_PATH}, resuming training...")
-            checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
+            log.info(f"\n💾 Found checkpoint in DB, resuming training...")
+            checkpoint = torch.load(io.BytesIO(checkpoint_blob), map_location=DEVICE, weights_only=False)
             model.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -1060,7 +1219,7 @@ def stream_train():
             best_val_acc = 0.0
             epochs_without_improvement = 0
     else:
-        log.info(f"\n💾 No checkpoint found at {CHECKPOINT_PATH}, starting fresh")
+        log.info(f"\n💾 No checkpoint found in DB, starting fresh")
 
     if start_epoch >= EPOCHS:
         log.info(f"   ℹ️ Checkpoint already completed all {EPOCHS} epochs - nothing to resume")
@@ -1219,47 +1378,50 @@ def stream_train():
         
         train_acc = 100 * train_correct / train_total if train_total > 0 else 0
         
-        # Validation - sample validation (use last batch as validation)
+        # Validation - a REAL held-out set now (see StreamingPokemonDataset:
+        # VAL_IMAGES_PER_SPECIES images per species are set aside during
+        # streaming and never yielded for training).
+        #
+        # BUG FIXED: this used to do `for img, label in dataset: ...` and
+        # take the first 50 items - but iterating `dataset` from scratch
+        # replays the SAME cached images in the SAME order every time,
+        # which is exactly what the training loop above had just trained
+        # on this epoch. Val Acc was measuring memorization of a training
+        # subset, not generalization - which made "best model" checkpoint
+        # selection and early stopping both unreliable.
         model.eval()
         val_correct = 0
         val_total = 0
+        val_set = dataset.get_val_set()
         
-        # Use a small validation set (last few images)
-        val_images = []
-        val_labels = []
-        val_count = 0
-        
-        for img, label in dataset:
-            val_images.append(img)
-            val_labels.append(label)
-            val_count += 1
-            if val_count >= 50:  # Small validation set
-                break
-        
-        if val_images:
-            batch_imgs = torch.stack(val_images).to(DEVICE)
-            batch_labels = torch.tensor(val_labels).to(DEVICE)
-            
-            pil_imgs = []
-            for i in range(batch_imgs.size(0)):
-                try:
-                    pil_img = transforms.ToPILImage()(batch_imgs[i].cpu())
-                    if pil_img.size[0] > 10 and pil_img.size[1] > 10:
-                        pil_imgs.append(pil_img)
-                except Exception:
-                    continue
-            
-            if pil_imgs:
-                with torch.no_grad():
-                    _, logits = model.forward_batch(pil_imgs)
-                    _, predicted = torch.max(logits, 1)
-                    val_total += batch_labels[:len(pil_imgs)].size(0)
-                    val_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
-            
-            del batch_imgs
-            del batch_labels
-            del pil_imgs
+        if val_set:
+            with torch.no_grad():
+                for i in range(0, len(val_set), STREAM_BATCH_SIZE):
+                    chunk = val_set[i:i + STREAM_BATCH_SIZE]
+                    batch_imgs = torch.stack([item[0] for item in chunk]).to(DEVICE)
+                    batch_labels = torch.tensor([item[1] for item in chunk]).to(DEVICE)
+                    
+                    pil_imgs = []
+                    for j in range(batch_imgs.size(0)):
+                        try:
+                            pil_img = transforms.ToPILImage()(batch_imgs[j].cpu())
+                            if pil_img.size[0] > 10 and pil_img.size[1] > 10:
+                                pil_imgs.append(pil_img)
+                        except Exception:
+                            continue
+                    
+                    if pil_imgs:
+                        _, logits = model.forward_batch(pil_imgs)
+                        _, predicted = torch.max(logits, 1)
+                        val_total += batch_labels[:len(pil_imgs)].size(0)
+                        val_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
+                    
+                    del batch_imgs, batch_labels, pil_imgs
             gc.collect()
+        else:
+            log.info(f"   ℹ️ No held-out validation images yet (still on the "
+                     f"first streaming pass) - Val Acc will read 0% until it "
+                     f"finishes collecting")
         
         val_acc = 100 * val_correct / val_total if val_total > 0 else 0
         
@@ -1291,9 +1453,10 @@ def stream_train():
         # moment estimates - skipping this would effectively reset the
         # optimizer and cause a training hiccup right after every resume),
         # scheduler state, and the epoch/best-acc bookkeeping needed to
-        # pick up counting from the right place.
+        # pick up counting from the right place. Written to the DB (Turso),
+        # not local disk - see Database.save_checkpoint_blob for why.
         try:
-            os.makedirs(os.path.dirname(CHECKPOINT_PATH) or ".", exist_ok=True)
+            buf = io.BytesIO()
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -1301,8 +1464,10 @@ def stream_train():
                 "scheduler_state_dict": scheduler.state_dict(),
                 "best_val_acc": best_val_acc,
                 "epochs_without_improvement": epochs_without_improvement,
-            }, CHECKPOINT_PATH)
-            log.info(f"   💾 Checkpoint saved (epoch {epoch+1}/{EPOCHS})")
+            }, buf)
+            db.save_checkpoint_blob(buf.getvalue())
+            log.info(f"   💾 Checkpoint saved to DB (epoch {epoch+1}/{EPOCHS}, "
+                     f"{len(buf.getvalue()) / 1024:.0f} KB)")
         except Exception as e:
             log.warning(f"   ⚠️ Failed to save checkpoint: {e}")
 
