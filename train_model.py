@@ -341,6 +341,11 @@ class Database:
         with the experimental Turso client in particular that repeated
         cursor/commit churn is a plausible source of memory growth over
         many batches. Batching it into one commit per chunk avoids that.
+
+        variant_name is offset by each species' EXISTING row count so
+        chunks accumulate (species_11, species_12, ...) instead of every
+        chunk restarting at species_1 and silently INSERT-OR-REPLACE-ing
+        over an earlier chunk's rows for the same species.
         """
         if not species_to_features:
             return
@@ -349,7 +354,11 @@ class Database:
             for species, features in species_to_features.items():
                 if not features:
                     continue
-                variant_names = [f"{species}_{i+1}" for i in range(len(features))]
+                cursor.execute(
+                    "SELECT COUNT(*) FROM pokemon_features WHERE species = ?", (species,)
+                )
+                existing_count = cursor.fetchone()[0]
+                variant_names = [f"{species}_{existing_count + i + 1}" for i in range(len(features))]
                 for i, feature in enumerate(features):
                     feature_json = json.dumps(feature.tolist())
                     cursor.execute("""
@@ -358,8 +367,11 @@ class Database:
                         VALUES (?, ?, ?, strftime('%s', 'now'))
                     """, (species, variant_names[i], feature_json))
                 cursor.execute("""
-                    INSERT OR REPLACE INTO species_info (species, count, last_updated)
+                    INSERT INTO species_info (species, count, last_updated)
                     VALUES (?, ?, strftime('%s', 'now'))
+                    ON CONFLICT(species) DO UPDATE SET
+                        count = count + excluded.count,
+                        last_updated = excluded.last_updated
                 """, (species, len(features)))
             self._conn.commit()
         finally:
@@ -435,9 +447,20 @@ class PokemonFeatureExtractor(nn.Module):
             log.warning(f"   ⚠️ Feature extraction failed: {e}")
             return np.zeros(256)
     
-    @torch.no_grad()
-    @torch.no_grad()
-    def extract_batch(self, images: List[Image.Image]) -> np.ndarray:
+    def extract_batch(self, images: List[Image.Image], grad: bool = False) -> np.ndarray:
+        """
+        grad=False (default): used everywhere at inference time (bot lookups,
+        DB feature snapshots) - whole thing runs under no_grad, nothing trains.
+
+        grad=True: used during training. The backbone is still frozen/no_grad
+        (it's pretrained ImageNet weights we don't want to disturb), but
+        `projection` runs WITH grad so its weights actually receive gradient
+        updates. Previously this whole method - backbone AND projection - ran
+        under @torch.no_grad(), so `projection` never trained and stayed at
+        its random init for the entire run while only the final classifier
+        head learned on top of that noise. That's a big part of why accuracy
+        was stuck low.
+        """
         valid_images = []
         for img in images:
             if img is not None and isinstance(img, Image.Image):
@@ -452,10 +475,25 @@ class PokemonFeatureExtractor(nn.Module):
         try:
             batch_tensor = torch.cat(valid_images, dim=0).to(DEVICE)
             batch_tensor = self.normalize(batch_tensor)
-            features = self.backbone(batch_tensor)  # already flat (N, backbone_dim)
-            projected = self.projection(features)
+
+            with torch.no_grad():
+                features = self.backbone(batch_tensor)  # frozen, already flat (N, backbone_dim)
+
+            if grad:
+                projected = self.projection(features)
+            else:
+                with torch.no_grad():
+                    projected = self.projection(features)
             projected = F.normalize(projected, p=2, dim=1)
-            
+
+            if grad:
+                # keep it a tensor with grad history for the training loop
+                result = projected
+                if len(valid_images) < len(images):
+                    pad = torch.zeros(len(images) - len(valid_images), result.shape[1], device=result.device)
+                    result = torch.cat([result, pad], dim=0)
+                return result
+
             result = projected.cpu().numpy()
             if len(valid_images) < len(images):
                 padded = np.zeros((len(images), result.shape[1]))
@@ -464,6 +502,8 @@ class PokemonFeatureExtractor(nn.Module):
             return result
         except Exception as e:
             log.warning(f"   ⚠️ Batch feature extraction failed: {e}")
+            if grad:
+                return torch.zeros(len(images), 256, device=DEVICE, requires_grad=True)
             return np.zeros((len(images), 256))
 
 
@@ -478,9 +518,13 @@ class PokemonClassifier(nn.Module):
             nn.Linear(512, num_species)
         )
     
-    def forward_batch(self, images: List[Image.Image]) -> Tuple[torch.Tensor, torch.Tensor]:
-        features = self.feature_extractor.extract_batch(images)
-        features_tensor = torch.tensor(features, dtype=torch.float32).to(DEVICE)
+    def forward_batch(self, images: List[Image.Image], grad: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        features = self.feature_extractor.extract_batch(images, grad=grad)
+        if grad:
+            # already a tensor with grad history - don't detach it via torch.tensor()
+            features_tensor = features.to(DEVICE)
+        else:
+            features_tensor = torch.tensor(features, dtype=torch.float32).to(DEVICE)
         logits = self.classifier(features_tensor)
         return features_tensor, logits
 
@@ -693,9 +737,23 @@ class StreamingPokemonDataset(IterableDataset):
             # Cap cache growth so a large run can't OOM the container.
             # Images beyond the cap still get trained on this epoch (via
             # the yield below), they just aren't retained for epoch 2+.
-            if MAX_CACHE_IMAGES <= 0 or len(self._cache) < MAX_CACHE_IMAGES:
+            #
+            # BUG FIXED: `MAX_CACHE_IMAGES <= 0 or ...` used to mean "0 = no
+            # limit" (the opposite of what the config comment above promises
+            # - "set to 0 to disable caching entirely"). With the default of
+            # 0 this appended EVERY streamed image to an unbounded in-memory
+            # list - on a ~27,975-image run that's several GB of uint8
+            # tensors, on top of the disk-backed chunk cache already doing
+            # the real epoch-2+ replay job below. That's what was causing
+            # the OOM kill. Now: when disk caching is on (the default),
+            # skip the in-RAM copy entirely since disk chunks already do
+            # cross-epoch replay. When disk caching is off, 0 actually
+            # disables the RAM cache as documented; a positive value caps it.
+            if self.disk_cache_enabled:
+                pass
+            elif MAX_CACHE_IMAGES > 0 and len(self._cache) < MAX_CACHE_IMAGES:
                 self._cache.append((tensor, label))
-            elif not cache_capped_warned:
+            elif MAX_CACHE_IMAGES > 0 and not cache_capped_warned:
                 cache_capped_warned = True
                 log.warning(f"   ⚠️ Cache cap ({MAX_CACHE_IMAGES} images) reached - "
                             f"later epochs will replay only the cached subset, "
@@ -948,10 +1006,19 @@ def stream_train():
     log.info("\n🧠 Initializing model...")
     model = PokemonClassifier(num_species=num_species)
     model.to(DEVICE)
-    model.feature_extractor.eval()
+    # Backbone (shufflenet) stays frozen - extract_batch always runs it under
+    # torch.no_grad() regardless of this train()/eval() call. `projection`
+    # has no BatchNorm/Dropout so train()/eval() doesn't change its math -
+    # this call just needs to not be .eval() so nothing here is confusing
+    # later. What actually makes projection trainable is passing its
+    # parameters to the optimizer below + forward_batch(..., grad=True).
+    model.feature_extractor.train()
     
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.classifier.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    optimizer = optim.AdamW(
+        list(model.classifier.parameters()) + list(model.feature_extractor.projection.parameters()),
+        lr=LEARNING_RATE, weight_decay=1e-4
+    )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     
     log.info(f"\n🎯 Training for {EPOCHS} epochs...")
@@ -1018,7 +1085,7 @@ def stream_train():
                 
                 features, logits = None, None
                 try:
-                    features, logits = model.forward_batch(pil_imgs)
+                    features, logits = model.forward_batch(pil_imgs, grad=True)
                     features = features.to(DEVICE)
                     logits = logits.to(DEVICE)
                     
@@ -1090,7 +1157,7 @@ def stream_train():
             
             if pil_imgs:
                 try:
-                    features, logits = model.forward_batch(pil_imgs)
+                    features, logits = model.forward_batch(pil_imgs, grad=True)
                     features = features.to(DEVICE)
                     logits = logits.to(DEVICE)
                     
