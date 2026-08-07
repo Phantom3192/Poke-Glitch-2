@@ -155,6 +155,12 @@ EARLY_STOP_ACC = float(os.getenv("EARLY_STOP_ACC", "95.0"))  # stop once train a
 EARLY_STOP_PATIENCE = int(os.getenv("EARLY_STOP_PATIENCE", "3"))  # stop if val acc doesn't improve for N epochs
 DATASET_NAME = os.getenv("DATASET_NAME", "SpreadSheets/Poketwo-Spawn-Images")
 MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
+# Full training state (model + optimizer + scheduler + epoch/best-acc
+# bookkeeping), written at the end of every epoch. This is what lets a
+# restart resume training instead of starting over with fresh random
+# weights - MODEL_OUTPUT above only ever held feature_extractor weights
+# and was write-only (nothing ever loaded it back in).
+CHECKPOINT_PATH = os.getenv("CHECKPOINT_PATH", "models/checkpoint.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
 AUTO_EXTRACT_ARCHIVES = os.getenv("AUTO_EXTRACT_ARCHIVES", "true").lower() == "true"
 MAX_SPECIES = int(os.getenv("MAX_SPECIES", "100"))  # Max species to train
@@ -1033,8 +1039,33 @@ def stream_train():
     best_val_acc = 0.0
     epochs_without_improvement = 0
     stop_training = False
-    
-    for epoch in range(EPOCHS):
+    start_epoch = 0
+
+    # ============ RESUME FROM CHECKPOINT IF ONE EXISTS ============
+    if os.path.exists(CHECKPOINT_PATH):
+        try:
+            log.info(f"\n💾 Found checkpoint at {CHECKPOINT_PATH}, resuming training...")
+            checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            start_epoch = checkpoint["epoch"] + 1
+            best_val_acc = checkpoint.get("best_val_acc", 0.0)
+            epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
+            log.info(f"   ✅ Resuming at epoch {start_epoch + 1}/{EPOCHS} "
+                     f"(best val acc so far: {best_val_acc:.1f}%)")
+        except Exception as e:
+            log.warning(f"   ⚠️ Failed to load checkpoint ({e}), starting fresh instead")
+            start_epoch = 0
+            best_val_acc = 0.0
+            epochs_without_improvement = 0
+    else:
+        log.info(f"\n💾 No checkpoint found at {CHECKPOINT_PATH}, starting fresh")
+
+    if start_epoch >= EPOCHS:
+        log.info(f"   ℹ️ Checkpoint already completed all {EPOCHS} epochs - nothing to resume")
+
+    for epoch in range(start_epoch, EPOCHS):
         log.info(f"\n📊 Epoch {epoch+1}/{EPOCHS}")
         
         model.train()
@@ -1093,7 +1124,7 @@ def stream_train():
                     loss.backward()
                     optimizer.step()
                     
-                    train_loss += loss.item()
+                    train_loss += loss.item() * batch_labels[:len(pil_imgs)].size(0)
                     _, predicted = torch.max(logits, 1)
                     train_total += batch_labels[:len(pil_imgs)].size(0)
                     train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
@@ -1165,7 +1196,7 @@ def stream_train():
                     loss.backward()
                     optimizer.step()
                     
-                    train_loss += loss.item()
+                    train_loss += loss.item() * batch_labels[:len(pil_imgs)].size(0)
                     _, predicted = torch.max(logits, 1)
                     train_total += batch_labels[:len(pil_imgs)].size(0)
                     train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
@@ -1251,7 +1282,30 @@ def stream_train():
             store_features_to_db(model, dataset, db, label=f"epoch {epoch+1}, val acc {val_acc:.1f}%")
         else:
             epochs_without_improvement += 1
-        
+
+        # Full training-state checkpoint, written EVERY epoch (regardless of
+        # whether val acc improved) - this is what makes a restart resume
+        # instead of starting over. Includes model weights (classifier +
+        # feature_extractor, so the projection layer's learned weights
+        # aren't lost either), optimizer state (AdamW's per-parameter
+        # moment estimates - skipping this would effectively reset the
+        # optimizer and cause a training hiccup right after every resume),
+        # scheduler state, and the epoch/best-acc bookkeeping needed to
+        # pick up counting from the right place.
+        try:
+            os.makedirs(os.path.dirname(CHECKPOINT_PATH) or ".", exist_ok=True)
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_val_acc": best_val_acc,
+                "epochs_without_improvement": epochs_without_improvement,
+            }, CHECKPOINT_PATH)
+            log.info(f"   💾 Checkpoint saved (epoch {epoch+1}/{EPOCHS})")
+        except Exception as e:
+            log.warning(f"   ⚠️ Failed to save checkpoint: {e}")
+
         # Stop across epochs if we've hit the target or plateaued
         if train_acc >= EARLY_STOP_ACC:
             log.info(f"   🎯 Training accuracy target reached ({train_acc:.1f}% >= "
