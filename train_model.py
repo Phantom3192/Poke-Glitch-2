@@ -444,22 +444,47 @@ class Database:
     def save_checkpoint_blob(self, data: bytes):
         """
         Stores the full training checkpoint (model + optimizer + scheduler
-        state) as base64 text in the training_metadata table, which already
-        exists for exactly this kind of key/value bookkeeping. Railway's
-        local container disk gets wiped on restart (confirmed by the
-        "No checkpoint found" + missing image-cache-chunk log lines - the
-        whole local filesystem is ephemeral there), but the Turso DB is
-        remote and clearly does survive restarts (Existing species/features
-        carry over every time). So the DB - not local disk - is the only
-        thing checkpointing can actually rely on here.
+        state) in the training_metadata table, split into ~400KB chunks
+        rather than one single row.
+
+        BUG FIXED: the previous version wrote the whole (multi-MB, base64-
+        encoded) checkpoint as ONE row. Turso's hosted service commonly
+        rejects or truncates large single-row writes - and the training
+        loop only ever caught that as a generic warning and moved on, so a
+        save could silently fail every single time with no clear signal in
+        the logs. That's the most likely explanation for "still crashed and
+        started from the beginning" even after checkpointing was added.
+        Splitting into small chunks avoids per-row size limits, and
+        reading the write back immediately (below) turns a silent failure
+        into a loud, specific one.
         """
+        CHUNK_SIZE = 400_000  # raw bytes per chunk, before base64 (~533KB encoded)
         cursor = self._conn.cursor()
         try:
-            b64 = base64.b64encode(data).decode("ascii")
+            chunks = [data[i:i + CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)] or [b""]
+            for i, chunk in enumerate(chunks):
+                b64 = base64.b64encode(chunk).decode("ascii")
+                cursor.execute("""
+                    INSERT OR REPLACE INTO training_metadata (key, value, updated_at)
+                    VALUES (?, ?, strftime('%s', 'now'))
+                """, (f"checkpoint_chunk_{i:04d}", b64))
+            # Meta row last, so a load never sees a meta count higher than
+            # the chunks actually written (e.g. if this call dies partway).
             cursor.execute("""
                 INSERT OR REPLACE INTO training_metadata (key, value, updated_at)
-                VALUES ('checkpoint', ?, strftime('%s', 'now'))
-            """, (b64,))
+                VALUES ('checkpoint_meta', ?, strftime('%s', 'now'))
+            """, (json.dumps({"chunks": len(chunks), "total_bytes": len(data)}),))
+            # Clean up any leftover chunks from a PREVIOUS checkpoint that
+            # had more chunks than this one (checkpoint size can shrink -
+            # e.g. optimizer state changes) - otherwise a load would
+            # wrongly append stale trailing bytes from an old save.
+            cursor.execute("""
+                SELECT key FROM training_metadata 
+                WHERE key LIKE 'checkpoint_chunk_%' AND key NOT IN ({})
+            """.format(",".join("?" * len(chunks))), tuple(f"checkpoint_chunk_{i:04d}" for i in range(len(chunks))))
+            stale_keys = [row[0] for row in cursor.fetchall()]
+            for key in stale_keys:
+                cursor.execute("DELETE FROM training_metadata WHERE key = ?", (key,))
             self._conn.commit()
         finally:
             try:
@@ -467,14 +492,39 @@ class Database:
             except Exception:
                 pass
 
+        # Read-after-write verification - turns a silent DB-side rejection
+        # into a loud, immediate, specific failure instead of a mysterious
+        # "why did it start from scratch again" three restarts from now.
+        verify = self.load_checkpoint_blob()
+        if verify is None or len(verify) != len(data):
+            got = 0 if verify is None else len(verify)
+            raise RuntimeError(
+                f"Checkpoint verification failed: wrote {len(data)} bytes, "
+                f"read back {got} bytes. The DB write likely did not "
+                f"actually persist (e.g. a Turso row/size limit)."
+            )
+
     def load_checkpoint_blob(self) -> Optional[bytes]:
         cursor = self._conn.cursor()
         try:
-            cursor.execute("SELECT value FROM training_metadata WHERE key = 'checkpoint'")
+            cursor.execute("SELECT value FROM training_metadata WHERE key = 'checkpoint_meta'")
             row = cursor.fetchone()
-            if row and row[0]:
-                return base64.b64decode(row[0])
-            return None
+            if not row or not row[0]:
+                return None
+            meta = json.loads(row[0])
+            num_chunks = meta.get("chunks", 0)
+            parts = []
+            for i in range(num_chunks):
+                cursor.execute(
+                    "SELECT value FROM training_metadata WHERE key = ?",
+                    (f"checkpoint_chunk_{i:04d}",)
+                )
+                r = cursor.fetchone()
+                if not r or not r[0]:
+                    log.warning(f"   ⚠️ Checkpoint chunk {i}/{num_chunks} missing from DB")
+                    return None
+                parts.append(base64.b64decode(r[0]))
+            return b"".join(parts)
         finally:
             try:
                 cursor.close()
@@ -1155,7 +1205,48 @@ def store_features_to_db(model, dataset, db, label="checkpoint"):
     log.info(f"   ✅ Stored {count} features in {elapsed:.0f}s")
 
 
+def _detect_container_memory_limit_mb() -> Optional[float]:
+    """
+    Reads the container's actual memory limit from cgroups, so the trainer
+    can size itself to the real constraint instead of guessing. Tries
+    cgroup v2 first (memory.max), then falls back to v1
+    (memory.limit_in_bytes). Returns None if undetectable (e.g. not
+    running in a container, or no limit set) rather than a fake number.
+    """
+    candidates = [
+        "/sys/fs/cgroup/memory.max",                    # cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",   # cgroup v1
+    ]
+    for path in candidates:
+        try:
+            with open(path) as f:
+                raw = f.read().strip()
+            if raw == "max":
+                continue  # no limit set on this cgroup
+            limit_bytes = int(raw)
+            # cgroup v1 with no real limit often reports a huge sentinel
+            # value (close to 2^63) instead of "max" - ignore those too.
+            if limit_bytes <= 0 or limit_bytes > (1 << 52):
+                continue
+            return limit_bytes / (1024 * 1024)
+        except Exception:
+            continue
+    return None
+
+
+def _get_current_rss_mb() -> Optional[float]:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return None
+
+
 def stream_train():    
+    global STREAM_BATCH_SIZE
     # ============ PRE-LOAD MODEL (NO DOWNLOAD DURING TRAINING) ============
 
     log.info("📥 Pre-loading AI model...")
@@ -1167,6 +1258,29 @@ def stream_train():
         log.warning(f"⚠️ Model pre-load failed: {e}")
     
     log_memory("baseline, right after model load")
+    baseline_rss_mb = _get_current_rss_mb()
+    container_limit_mb = _detect_container_memory_limit_mb()
+
+    if container_limit_mb is not None:
+        log.info(f"   📦 Detected container memory limit: {container_limit_mb:.0f} MB")
+        if baseline_rss_mb is not None:
+            # Each image in a stream batch costs roughly ~15MB of transient
+            # memory during PIL conversion + transform + forward/backward
+            # (measured from observed batch spikes: ~690MB baseline -> ~1150MB
+            # at batch 1 with STREAM_BATCH_SIZE=32 -> (1150-690)/32 ≈ 14.4MB/img).
+            # Keep total usage under 75% of the limit as a safety margin for
+            # the OS, other processes, and normal fragmentation.
+            safety_budget_mb = container_limit_mb * 0.75 - baseline_rss_mb
+            safe_batch_size = max(4, int(safety_budget_mb / 15))
+            if STREAM_BATCH_SIZE > safe_batch_size:
+                log.warning(f"   ⚠️ STREAM_BATCH_SIZE={STREAM_BATCH_SIZE} looks risky for a "
+                            f"{container_limit_mb:.0f}MB container with a {baseline_rss_mb:.0f}MB "
+                            f"baseline - auto-lowering to {safe_batch_size} to avoid OOM. "
+                            f"Set STREAM_BATCH_SIZE explicitly to override this.")
+                STREAM_BATCH_SIZE = safe_batch_size
+    else:
+        log.info(f"   📦 Could not detect a container memory limit (not cgroup-limited, "
+                 f"or running outside a container)")
     
     """Train using streaming - process in batches, clear memory."""
     
@@ -1264,7 +1378,7 @@ def stream_train():
             log.info(f"   ✅ Resuming at epoch {start_epoch + 1}/{EPOCHS} "
                      f"(best val acc so far: {best_val_acc:.1f}%)")
         except Exception as e:
-            log.warning(f"   ⚠️ Failed to load checkpoint ({e}), starting fresh instead")
+            log.exception(f"   ❌ Failed to load checkpoint ({e}), starting fresh instead")
             start_epoch = 0
             best_val_acc = 0.0
             epochs_without_improvement = 0
@@ -1276,7 +1390,8 @@ def stream_train():
 
     # Config for periodic mid-epoch checkpointing - see note below on why
     # end-of-epoch-only checkpointing wasn't enough.
-    CHECKPOINT_EVERY_N_BATCHES = int(os.getenv("CHECKPOINT_EVERY_N_BATCHES", "25"))
+    CHECKPOINT_EVERY_N_BATCHES = int(os.getenv("CHECKPOINT_EVERY_N_BATCHES", "20"))
+    last_emergency_checkpoint_batch = [-999]  # list so the batch loop can mutate it in place
 
     def _save_checkpoint(epoch_idx: int, is_epoch_complete: bool):
         """
@@ -1308,7 +1423,11 @@ def stream_train():
             log.info(f"   💾 Checkpoint saved to DB ({tag}, epoch {epoch_idx+1}/{EPOCHS}, "
                      f"{len(buf.getvalue()) / 1024:.0f} KB)")
         except Exception as e:
-            log.warning(f"   ⚠️ Failed to save checkpoint: {e}")
+            # log.exception (not log.warning(str(e))) so the full traceback
+            # actually shows up in the logs - a silent/vague failure here
+            # was the likely reason checkpoints appeared to save but a
+            # restart still found nothing to resume from.
+            log.exception(f"   ❌ Failed to save checkpoint (epoch {epoch_idx+1}): {e}")
 
     for epoch in range(start_epoch, EPOCHS):
         log.info(f"\n📊 Epoch {epoch+1}/{EPOCHS}")
@@ -1414,6 +1533,24 @@ def stream_train():
                 gc.collect()
                 _trim_memory()
                 log_memory(f"batch {batch_count}")
+                
+                # Proactive safety net: if current usage is creeping toward
+                # the container's actual limit, get a fresh checkpoint out
+                # NOW rather than waiting for the next scheduled save - a
+                # kernel OOM kill is a hard SIGKILL with zero warning, so
+                # whatever checkpoint existed a few batches ago is all a
+                # restart will have. This can't prevent the kill itself,
+                # only minimize how much progress it costs.
+                if container_limit_mb is not None:
+                    current_rss = _get_current_rss_mb()
+                    if (current_rss is not None
+                            and current_rss > container_limit_mb * 0.85
+                            and batch_count - last_emergency_checkpoint_batch[0] >= 5):
+                        log.warning(f"   🚨 Current RSS ({current_rss:.0f} MB) is above 85% of "
+                                    f"the {container_limit_mb:.0f} MB container limit - saving "
+                                    f"an emergency checkpoint now")
+                        _save_checkpoint(epoch, is_epoch_complete=False)
+                        last_emergency_checkpoint_batch[0] = batch_count
                 
                 # Reset buffer
                 image_buffer = []
