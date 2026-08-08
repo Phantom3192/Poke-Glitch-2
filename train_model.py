@@ -78,14 +78,51 @@ log = SilentLogger()
 
 def log_memory(tag: str = ""):
     """
-    Logs current process RSS (resident memory) using stdlib `resource`
-    - no extra dependency. Lets you actually watch memory climb in the
-    Railway logs batch-by-batch instead of only finding out when the
-    container gets killed. ru_maxrss is KB on Linux.
+    Logs both:
+    - peak RSS (ru_maxrss) - a HIGH-WATER MARK. By OS definition this can
+      only stay flat or increase for the life of the process, no matter how
+      well memory gets cleaned up afterward - a batch that transiently
+      spiked memory once will keep this number elevated forever after,
+      even if current usage drops right back down. This is why the old
+      logs looked like a runaway leak even when cleanup was working.
+    - current RSS (from /proc/self/status VmRSS, Linux-only, no extra
+      dependency) - what's ACTUALLY resident right now. This is the number
+      that actually predicts whether the next batch will get OOM-killed,
+      and it's what _trim_memory() below is trying to keep low.
     """
     try:
-        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-        log.info(f"   🧠 Memory{f' ({tag})' if tag else ''}: {rss_mb:.0f} MB peak RSS")
+        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        current_mb = None
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        current_mb = int(line.split()[1]) / 1024
+                        break
+        except Exception:
+            pass
+        if current_mb is not None:
+            log.info(f"   🧠 Memory{f' ({tag})' if tag else ''}: "
+                     f"{current_mb:.0f} MB current RSS, {peak_mb:.0f} MB peak RSS")
+        else:
+            log.info(f"   🧠 Memory{f' ({tag})' if tag else ''}: {peak_mb:.0f} MB peak RSS")
+    except Exception:
+        pass
+
+
+def _trim_memory():
+    """
+    Python/glibc's allocator frequently keeps freed heap pages around as
+    reusable arenas instead of actually returning them to the OS, even
+    after gc.collect() runs. That gap between "Python thinks it's freed
+    this" and "the OS sees the memory back" is exactly what can push a
+    <1GB container over its limit despite per-batch cleanup already being
+    in place. malloc_trim(0) asks glibc to hand freed-but-retained pages
+    back to the OS immediately. No-ops safely on non-glibc platforms.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
 
@@ -782,6 +819,7 @@ class StreamingPokemonDataset(IterableDataset):
                 except Exception as e:
                     log.warning(f"   ⚠️ Failed to load cache chunk {chunk_path}: {e}")
             gc.collect()
+            _trim_memory()
             return
         
         if self._cache_ready:
@@ -825,6 +863,7 @@ class StreamingPokemonDataset(IterableDataset):
                 except Exception as e:
                     log.warning(f"   ⚠️ Failed to replay partial chunk {chunk_path}: {e}")
             gc.collect()
+            _trim_memory()
             log.info(f"   💽 Replayed {replayed} images from partial cache "
                      f"({collected}/{target_total}) - resuming HF stream for the rest")
 
@@ -846,6 +885,7 @@ class StreamingPokemonDataset(IterableDataset):
                 log.warning(f"   ⚠️ Failed to write cache chunk to disk: {e}")
             disk_buffer = []
             gc.collect()
+            _trim_memory()
         
         def _emit(tensor, label, species):
             nonlocal collected, cache_capped_warned
@@ -1106,6 +1146,7 @@ def store_features_to_db(model, dataset, db, label="checkpoint"):
             db.add_pokemon_features_batch(feature_buffer)
             feature_buffer = {}
             gc.collect()
+            _trim_memory()
     
     flush_batch()
     db.add_pokemon_features_batch(feature_buffer)
@@ -1208,7 +1249,16 @@ def stream_train():
             model.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            start_epoch = checkpoint["epoch"] + 1
+            # A mid-epoch checkpoint (is_epoch_complete=False) means this
+            # epoch's data pass never finished - re-run this SAME epoch
+            # number (its weights are already partially trained, just not
+            # its exact position in the data stream) instead of skipping to
+            # the next one and silently dropping the rest of this epoch's
+            # data forever.
+            if checkpoint.get("is_epoch_complete", True):
+                start_epoch = checkpoint["epoch"] + 1
+            else:
+                start_epoch = checkpoint["epoch"]
             best_val_acc = checkpoint.get("best_val_acc", 0.0)
             epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
             log.info(f"   ✅ Resuming at epoch {start_epoch + 1}/{EPOCHS} "
@@ -1223,6 +1273,42 @@ def stream_train():
 
     if start_epoch >= EPOCHS:
         log.info(f"   ℹ️ Checkpoint already completed all {EPOCHS} epochs - nothing to resume")
+
+    # Config for periodic mid-epoch checkpointing - see note below on why
+    # end-of-epoch-only checkpointing wasn't enough.
+    CHECKPOINT_EVERY_N_BATCHES = int(os.getenv("CHECKPOINT_EVERY_N_BATCHES", "25"))
+
+    def _save_checkpoint(epoch_idx: int, is_epoch_complete: bool):
+        """
+        BUG FIXED: checkpointing used to happen only at the END of a
+        completed epoch. With ~28,625 images to stream per epoch on this
+        dataset, epoch 1 alone can take many hours - if the process gets
+        killed (OOM, redeploy, crash) before finishing even ONE epoch,
+        there was NO checkpoint yet to resume from at all, so a restart
+        always retrained from random weights regardless of how far batch_count
+        had gotten. Now this also gets called periodically mid-epoch
+        (every CHECKPOINT_EVERY_N_BATCHES batches), tagged
+        is_epoch_complete=False, so a mid-epoch crash still has recent
+        weights to resume from - only the exact batch position within the
+        epoch's data stream is lost, not the learning itself.
+        """
+        try:
+            buf = io.BytesIO()
+            torch.save({
+                "epoch": epoch_idx,
+                "is_epoch_complete": is_epoch_complete,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_val_acc": best_val_acc,
+                "epochs_without_improvement": epochs_without_improvement,
+            }, buf)
+            db.save_checkpoint_blob(buf.getvalue())
+            tag = "epoch complete" if is_epoch_complete else "mid-epoch"
+            log.info(f"   💾 Checkpoint saved to DB ({tag}, epoch {epoch_idx+1}/{EPOCHS}, "
+                     f"{len(buf.getvalue()) / 1024:.0f} KB)")
+        except Exception as e:
+            log.warning(f"   ⚠️ Failed to save checkpoint: {e}")
 
     for epoch in range(start_epoch, EPOCHS):
         log.info(f"\n📊 Epoch {epoch+1}/{EPOCHS}")
@@ -1299,6 +1385,11 @@ def stream_train():
                     acc = 100 * train_correct / train_total if train_total > 0 else 0
                     log.info(f"   📊 Batch {batch_count}: Loss: {train_loss/train_total:.3f}, Acc: {acc:.1f}%")
                     
+                    # Periodic mid-epoch checkpoint - see _save_checkpoint's
+                    # docstring for why end-of-epoch-only wasn't enough.
+                    if batch_count % CHECKPOINT_EVERY_N_BATCHES == 0:
+                        _save_checkpoint(epoch, is_epoch_complete=False)
+                    
                     # Stop this epoch early once training accuracy hits the
                     # target — no point grinding through remaining batches.
                     # Require a few batches first so one lucky batch doesn't
@@ -1308,6 +1399,7 @@ def stream_train():
                                  f"{EARLY_STOP_ACC}%), moving on early")
                         del batch_imgs, batch_labels, pil_imgs
                         gc.collect()
+                        _trim_memory()
                         break
                     
                 except Exception as e:
@@ -1320,6 +1412,7 @@ def stream_train():
                 del features, logits
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 gc.collect()
+                _trim_memory()
                 log_memory(f"batch {batch_count}")
                 
                 # Reset buffer
@@ -1374,6 +1467,7 @@ def stream_train():
                 del batch_labels
                 del pil_imgs
                 gc.collect()
+                _trim_memory()
                 log_memory("leftover chunk")
         
         train_acc = 100 * train_correct / train_total if train_total > 0 else 0
@@ -1418,6 +1512,7 @@ def stream_train():
                     
                     del batch_imgs, batch_labels, pil_imgs
             gc.collect()
+            _trim_memory()
         else:
             log.info(f"   ℹ️ No held-out validation images yet (still on the "
                      f"first streaming pass) - Val Acc will read 0% until it "
@@ -1445,31 +1540,9 @@ def stream_train():
         else:
             epochs_without_improvement += 1
 
-        # Full training-state checkpoint, written EVERY epoch (regardless of
-        # whether val acc improved) - this is what makes a restart resume
-        # instead of starting over. Includes model weights (classifier +
-        # feature_extractor, so the projection layer's learned weights
-        # aren't lost either), optimizer state (AdamW's per-parameter
-        # moment estimates - skipping this would effectively reset the
-        # optimizer and cause a training hiccup right after every resume),
-        # scheduler state, and the epoch/best-acc bookkeeping needed to
-        # pick up counting from the right place. Written to the DB (Turso),
-        # not local disk - see Database.save_checkpoint_blob for why.
-        try:
-            buf = io.BytesIO()
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "best_val_acc": best_val_acc,
-                "epochs_without_improvement": epochs_without_improvement,
-            }, buf)
-            db.save_checkpoint_blob(buf.getvalue())
-            log.info(f"   💾 Checkpoint saved to DB (epoch {epoch+1}/{EPOCHS}, "
-                     f"{len(buf.getvalue()) / 1024:.0f} KB)")
-        except Exception as e:
-            log.warning(f"   ⚠️ Failed to save checkpoint: {e}")
+        # Full training-state checkpoint at epoch end. Written to the DB
+        # (Turso), not local disk - see Database.save_checkpoint_blob.
+        _save_checkpoint(epoch, is_epoch_complete=True)
 
         # Stop across epochs if we've hit the target or plateaued
         if train_acc >= EARLY_STOP_ACC:
